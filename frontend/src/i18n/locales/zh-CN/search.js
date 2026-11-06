@@ -28,7 +28,7 @@ export default {
     },
 
     errors: {
-      queryTooShort: "搜索关键词至少需要3个字符",
+      queryTooShort: "搜索关键词至少需要{count}个字符",
       searchFailed: "搜索失败，请稍后重试",
       loadMoreFailed: "加载更多结果失败",
     },

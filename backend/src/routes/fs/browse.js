@@ -240,7 +240,7 @@ const enrichDirectoryListWithFolderSummaries = async ({ db, fileSystem, result, 
     typeof mountRow?.cache_ttl === "number" && Number.isFinite(mountRow.cache_ttl) ? mountRow.cache_ttl : Number(mountRow?.cache_ttl || 0);
 
   // 索引状态（用于决定“索引 vs 计算”的优先级）
-  const store = new FsSearchIndexStore(db);
+  const store = new FsSearchIndexStore(db, { env: fileSystem?.env || {} });
   const states = await store.getIndexStates([mountId]);
   const state = states.get(mountId);
   const isIndexReady = state && String(state.status) === "ready";

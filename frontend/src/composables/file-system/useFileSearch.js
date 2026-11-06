@@ -42,11 +42,27 @@ export function useFileSearch() {
   const maxHistoryItems = 10;
 
   // 计算属性
-  // 后端统一最小长度：FTS5 trigram contains（>=3 字符）
-  const hasSearchQuery = computed(() => searchQuery.value.trim().length >= 3);
+  // 最小查询长度由后端方言决定（sqlite FTS5 trigram=3；postgres/mysql LIKE=1）
+  // 初始值用 3 兜底，挂载后向 /api/system/search-config 同步真实值
+  const minQueryLength = ref(3);
+
+  const loadMinQueryLength = async () => {
+    try {
+      const cfg = await api.system.getSearchConfig();
+      const n = Number(cfg?.min_query_length);
+      if (Number.isInteger(n) && n > 0 && n !== minQueryLength.value) {
+        minQueryLength.value = n;
+      }
+    } catch (err) {
+      log.debug("获取搜索最小查询长度失败，沿用默认值:", err);
+    }
+  };
+
+  const hasSearchQuery = computed(() => searchQuery.value.trim().length >= minQueryLength.value);
   const hasSearchResults = computed(() => searchResults.value.length > 0);
   const searchResultsCount = computed(() => searchResults.value.length);
   const canSearch = computed(() => hasSearchQuery.value && !isSearching.value);
+  const queryTooShortMessage = computed(() => t("search.errors.queryTooShort", { count: minQueryLength.value }));
 
   // 搜索结果统计
   const searchStats = ref({
@@ -65,8 +81,8 @@ export function useFileSearch() {
     try {
       const searchTerm = query || searchQuery.value;
 
-      if (!searchTerm || searchTerm.trim().length < 3) {
-        searchError.value = t("search.errors.queryTooShort");
+      if (!searchTerm || searchTerm.trim().length < minQueryLength.value) {
+        searchError.value = queryTooShortMessage.value;
         return;
       }
 
@@ -305,6 +321,8 @@ export function useFileSearch() {
 
   // 初始化时加载搜索历史
   loadSearchHistory();
+  // 同步后端方言决定的最小查询长度（失败沿用 3）
+  loadMinQueryLength();
 
   // 监听认证状态变化，清除搜索结果
   watch(
@@ -333,6 +351,8 @@ export function useFileSearch() {
     hasSearchResults,
     searchResultsCount,
     canSearch,
+    minQueryLength,
+    queryTooShortMessage,
 
     // 方法
     performSearch,

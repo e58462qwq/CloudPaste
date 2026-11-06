@@ -73,6 +73,26 @@ export async function getMaxUploadSize() {
 }
 
 /**
+ * 获取搜索能力配置（公共接口）
+ * - 后端按数据库方言返回最小查询长度与匹配模式
+ * - 前端据此做输入校验与提示，避免与服务端校验脱节
+ * @returns {Promise<{dialect: string, dialect_id: string, min_query_length: number, contains_mode: string}>}
+ */
+export async function getSearchConfig() {
+  const fallback = { dialect: "sqlite", dialect_id: "sqlite-fts5-trigram", min_query_length: 3, contains_mode: "fts5-trigram" };
+  try {
+    const response = await get("system/search-config");
+    if (response && response.data && Number(response.data.min_query_length) > 0) {
+      return { ...fallback, ...response.data };
+    }
+    return fallback;
+  } catch (error) {
+    log.warn("获取搜索配置失败，使用默认值:", error);
+    return fallback;
+  }
+}
+
+/**
  * 获取上传进度（通用后端进度接口）
  * @param {string} uploadId 上传ID
  * @returns {Promise<Object>} 进度信息 { id, loaded, total, completed, path, storageType, updatedAt }

@@ -18,6 +18,11 @@ import { getEncryptionSecret } from "../utils/environmentUtils.js";
 import { getStorageUsageReport } from "../services/storageUsageReportService.js";
 import { StorageUsageService } from "../storage/usage/StorageUsageService.js";
 import { ensureRepositoryFactory } from "../utils/repositories.js";
+import {
+  createSearchDialect,
+  getSearchMinQueryLength,
+  resolveSearchDialectName,
+} from "../storage/fs/search/dialects/index.js";
 
 const systemRoutes = new Hono();
 const requireAdmin = usePolicy("admin.all");
@@ -30,6 +35,25 @@ systemRoutes.get("/api/system/max-upload-size", async (c) => {
   const size = await getMaxUploadSize(db, repositoryFactory);
 
   return jsonOk(c, { max_upload_size: size }, "获取最大上传大小成功");
+});
+
+// 搜索能力配置（公共API）
+// 前端需要知道当前后端的方言与最小查询长度，才能给出正确的输入校验与提示文案
+systemRoutes.get("/api/system/search-config", async (c) => {
+  const env = c.env || {};
+  const dialectName = resolveSearchDialectName(env);
+  const dialect = createSearchDialect(dialectName);
+
+  return jsonOk(
+    c,
+    {
+      dialect: dialectName,
+      dialect_id: dialect?.id || "sqlite-fts5-trigram",
+      min_query_length: getSearchMinQueryLength(env),
+      contains_mode: dialect?.containsMode || "fts5-trigram",
+    },
+    "获取搜索配置成功",
+  );
 });
 
 // 通用上传进度查询（公共API）

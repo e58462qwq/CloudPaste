@@ -16,8 +16,26 @@ export type FsSearchIndexEntryInput = {
   mimetype?: string | null;
 };
 
+export type FsSearchDialect = {
+  id: string;
+  minQueryLength: number;
+  containsMode?: string;
+  buildSearchSql(params: any): { sql: string; bind: any[] };
+  buildCountSql(params: any): { sql: string; bind: any[] };
+  buildChildDirectoryAggregatesSql?(
+    mountId: string,
+    parentDirFsPath: string,
+  ): { sql: string; bind: any[] } | null;
+};
+
 export class FsSearchIndexStore {
-  constructor(db: any);
+  /**
+   * @param db D1Database / SQLiteAdapter
+   * @param options.dialect 直接注入方言对象（优先级最高）
+   * @param options.dialectName 按名称构造（sqlite/postgres/mysql）
+   * @param options.env 从 env.DB_PROVIDER / DB_DIALECT 推导，缺失回退 sqlite
+   */
+  constructor(db: any, options?: { dialect?: FsSearchDialect; dialectName?: string; env?: any });
 
   getIndexStates(mountIds: string[]): Promise<Map<string, any>>;
   getDirtyCounts(mountIds: string[]): Promise<Map<string, number>>;

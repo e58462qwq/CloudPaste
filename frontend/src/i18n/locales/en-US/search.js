@@ -28,7 +28,7 @@ export default {
     },
 
     errors: {
-      queryTooShort: "Search keywords must be at least 3 characters",
+      queryTooShort: "Search keywords must be at least {count} characters",
       searchFailed: "Search failed, please try again later",
       loadMoreFailed: "Failed to load more results",
     },

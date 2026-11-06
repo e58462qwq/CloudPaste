@@ -9,6 +9,7 @@ import { MountManager } from "../storage/managers/MountManager.js";
 import { FileSystem } from "../storage/fs/FileSystem.js";
 import { ensureRepositoryFactory } from "../utils/repositories.js";
 import { FsSearchIndexStore } from "../storage/fs/search/FsSearchIndexStore.js";
+import { getSearchMinQueryLength } from "../storage/fs/search/dialects/index.js";
 
 /**
  * 管理员 - FS 搜索索引管理路由
@@ -100,7 +101,7 @@ adminFsIndexRoutes.get("/api/admin/fs/index/status", requireAdmin, async (c) => 
       items,
       runningJobs,
       hints: {
-        minQueryLength: 3,
+        minQueryLength: getSearchMinQueryLength(c.env || {}),
         dirtyRebuildThreshold: DIRTY_REBUILD_THRESHOLD,
       },
     },

@@ -10,7 +10,7 @@
 import { DbTables } from "../../../constants/index.js";
 import { ValidationError } from "../../../http/errors.js";
 import { decodeSearchCursor, encodeSearchCursor } from "./FsSearchCursor.js";
-import { createSqliteFts5TrigramDialect } from "./dialects/sqliteFts5TrigramDialect.js";
+import { createSearchDialect, resolveSearchDialectName } from "./dialects/index.js";
 
 function nowMs() {
   return Date.now();
@@ -43,13 +43,19 @@ function buildTrigramMatchQuery(raw) {
 export class FsSearchIndexStore {
   /**
    * @param {any} db D1Database / SQLiteAdapter
+   * @param {{ dialect?: any, dialectName?: string, env?: any }} [options]
+   *   - dialect：直接注入方言对象（优先级最高）
+   *   - dialectName：按名称构造（sqlite/postgres/mysql）
+   *   - env：从 env.DB_PROVIDER / DB_DIALECT 推导，缺失时回退 sqlite
    */
-  constructor(db) {
+  constructor(db, options = {}) {
     if (!db) {
       throw new ValidationError("FsSearchIndexStore: 缺少 db");
     }
     this.db = db;
-    this.dialect = createSqliteFts5TrigramDialect();
+    this.dialect =
+      options?.dialect ||
+      createSearchDialect(options?.dialectName || resolveSearchDialectName(options?.env || {}));
   }
 
   /**
@@ -88,36 +94,10 @@ export class FsSearchIndexStore {
     const id = String(mountId || "").trim();
     if (!id) return [];
 
-    let parent = String(parentDirFsPath || "").trim();
-    if (!parent) return [];
-    if (parent !== "/" && !parent.endsWith("/")) parent = `${parent}/`;
+    const built = this.dialect.buildChildDirectoryAggregatesSql?.(id, parentDirFsPath);
+    if (!built) return [];
 
-    // SQLite substr 是 1-based；这里取 parent 后面的相对路径
-    const startPos = parent.length + 1;
-    const likePrefix = `${parent}%`;
-
-    const sql = `
-      WITH scoped AS (
-        SELECT
-          fs_path,
-          is_dir,
-          size,
-          modified_ms,
-          substr(fs_path, ?) AS rel
-        FROM ${DbTables.FS_SEARCH_INDEX_ENTRIES}
-        WHERE mount_id = ? AND fs_path LIKE ?
-      )
-      SELECT
-        (? || substr(rel, 1, instr(rel, '/'))) AS dir_path,
-        COALESCE(SUM(CASE WHEN is_dir = 0 THEN size ELSE 0 END), 0) AS total_size,
-        COALESCE(MAX(modified_ms), 0) AS latest_modified_ms,
-        COUNT(*) AS entry_count
-      FROM scoped
-      WHERE instr(rel, '/') > 0
-      GROUP BY dir_path
-    `;
-
-    const resp = await this.db.prepare(sql).bind(startPos, id, likePrefix, parent).all();
+    const resp = await this.db.prepare(built.sql).bind(...built.bind).all();
     return Array.isArray(resp?.results) ? resp.results : [];
   }
 
@@ -485,8 +465,9 @@ export class FsSearchIndexStore {
    */
   async search(params) {
     const query = normalizeQuery(params?.query);
-    if (query.length < this.dialect.minQueryLength) {
-      throw new ValidationError("搜索查询至少需要3个字符");
+    const minQueryLength = Number(this.dialect.minQueryLength) || 1;
+    if (query.length < minQueryLength) {
+      throw new ValidationError(`搜索查询至少需要${minQueryLength}个字符`);
     }
 
     const scope = params?.scope || "global";
