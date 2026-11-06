@@ -199,13 +199,14 @@ export function useFileshareService() {
    * 返回体结构：{ success, code, message, data: { results, summary } }
    *
    * @param {Array<string>} ids
+   * @param {Object} options - 透传给请求层，常用 { timeout }
    * @returns {Promise<{results: Array, summary: Object}>}
    */
-  const verifyFiles = async (ids) => {
+  const verifyFiles = async (ids, options = {}) => {
     if (!Array.isArray(ids) || ids.length === 0) {
       throw new Error("缺少要检测的文件 ID 列表");
     }
-    const resp = await apiVerifyFiles(ids);
+    const resp = await apiVerifyFiles(ids, options);
     if (!resp) {
       throw new Error("检测文件有效性失败");
     }

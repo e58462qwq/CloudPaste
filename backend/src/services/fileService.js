@@ -14,6 +14,35 @@ import { ObjectStore } from "../storage/object/ObjectStore.js";
 import { LinkService } from "../storage/link/LinkService.js";
 import { resolvePreviewSelection } from "./documentPreviewService.js";
 
+// 有效性检测默认并发与单条超时
+// 逐条串行会让批量检测在慢存储上远超前端请求超时（默认 30s）；
+// 一条存储卡死也不应该拖垮整批，因此同时加单条超时保护。
+const VERIFY_DEFAULT_CONCURRENCY = 8;
+const VERIFY_MAX_CONCURRENCY = 32;
+const VERIFY_ITEM_TIMEOUT_MS = 15000;
+
+function withItemTimeout(promise, timeoutMs, message) {
+  if (!timeoutMs || timeoutMs <= 0) return promise;
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(message);
+      error.name = "TimeoutError";
+      reject(error);
+    }, timeoutMs);
+    const handle = timer;
+    if (handle && typeof handle.unref === "function") handle.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function normalizeConcurrency(value) {
+  const raw = Number.isFinite(value) ? Math.trunc(value) : VERIFY_DEFAULT_CONCURRENCY;
+  return Math.min(Math.max(raw, 1), VERIFY_MAX_CONCURRENCY);
+}
+
 export class FileService {
   /**
    * 构造函数
@@ -474,15 +503,26 @@ export class FileService {
    * - error            存储不可达/鉴权失败等，无法判定（不等于文件丢失）
    *
    * @param {Array<string>} ids - 文件 ID 列表
-   * @param {Object} options - { userType, userId, request, env }
+   * @param {Object} options - { userType, userId, request, env, concurrency, itemTimeoutMs }
+   *   concurrency 默认 8（上限 32），itemTimeoutMs 默认 15000；两者都用于避免批量检测被慢存储拖到超时
    * @returns {Promise<Object>} { results, summary }
    */
   async verifyFiles(ids, options = {}) {
-    const { userType = UserType.ADMIN, userId = null, request = null, env = null } = options || {};
+    const {
+      userType = UserType.ADMIN,
+      userId = null,
+      request = null,
+      env = null,
+      concurrency = VERIFY_DEFAULT_CONCURRENCY,
+      itemTimeoutMs = VERIFY_ITEM_TIMEOUT_MS,
+    } = options || {};
+
     const isAdmin = userType !== UserType.API_KEY;
     const ownerId = isAdmin ? userId : `apikey:${userId}`;
 
-    const results = [];
+    // 空 id 直接跳过，但保留其余条目的输入顺序
+    const targets = (Array.isArray(ids) ? ids : []).filter((id) => Boolean(id));
+
     const objectStore = new ObjectStore(this.db, this.encryptionSecret, this.repositoryFactory);
 
     let fsContext = null;
@@ -495,65 +535,26 @@ export class FileService {
       return fsContext;
     };
 
-    for (const id of ids) {
-      if (!id) continue;
+    const ctx = { isAdmin, ownerId, userType, request, objectStore, getFsContext, itemTimeoutMs };
 
-      const entry = { id: String(id), status: "error", message: null, size: null, storage_size: null };
+    // 有界并发 + 结果按输入下标回填，保证返回顺序与请求一致
+    const slots = new Array(targets.length);
+    const workerCount = Math.min(normalizeConcurrency(concurrency), targets.length);
+    let cursor = 0;
 
-      try {
-        const file = isAdmin
-          ? await this.fileRepository.findByIdWithStorageConfig(id)
-          : await this.fileRepository.findByIdAndCreator(id, ownerId);
-
-        if (!file) {
-          results.push({ ...entry, status: "missing_record", message: "文件记录不存在或无权访问" });
-          continue;
-        }
-
-        entry.filename = file.filename;
-        entry.storage_config_id = file.storage_config_id || null;
-        entry.storage_path = file.storage_path || null;
-        entry.size = typeof file.size === "number" ? file.size : Number(file.size) || 0;
-
-        // 记录层：过期 / 超出查看次数
-        const access = this.validateFileAccess(file);
-        if (!access.accessible && access.reason === "expired") {
-          results.push({ ...entry, status: "expired", message: "文件已过期或查看次数已用尽" });
-          continue;
-        }
-
-        // 存储层：storage-first 为主路径，file_path 作为回退
-        let info = null;
-        if (file.storage_config_id && file.storage_path) {
-          info = await objectStore.getInfoByStoragePath(file.storage_config_id, file.storage_path, { request });
-        } else if (file.file_path) {
-          const { fileSystem } = await getFsContext();
-          info = await fileSystem.getFileInfo(file.file_path, ownerId, userType, request);
-        } else {
-          results.push({ ...entry, status: "error", message: "记录缺少存储路径，无法定位对象" });
-          continue;
-        }
-
-        const storageSize = info && typeof info.size === "number" ? info.size : null;
-        results.push({
-          ...entry,
-          status: "valid",
-          message: null,
-          storage_size: storageSize,
-          size_mismatch: storageSize !== null && entry.size > 0 && storageSize !== entry.size,
-          mimetype: info?.mimetype || null,
-        });
-      } catch (error) {
-        // 对象不存在 vs 存储不可达，必须区分：前者是失效文件，后者是判定失败
-        const notFound = error instanceof NotFoundError || error?.name === "NotFoundError";
-        results.push({
-          ...entry,
-          status: notFound ? "missing_object" : "error",
-          message: notFound ? "存储中已找不到该文件对象" : error?.message || "存储校验失败",
-        });
+    const runWorker = async () => {
+      while (cursor < targets.length) {
+        const index = cursor;
+        cursor += 1;
+        slots[index] = await this._verifySingleFile(targets[index], ctx);
       }
+    };
+
+    if (workerCount > 0) {
+      await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
     }
 
+    const results = slots.filter(Boolean);
     const summary = {
       total: results.length,
       valid: results.filter((r) => r.status === "valid").length,
@@ -563,6 +564,73 @@ export class FileService {
     };
 
     return { results, summary };
+  }
+
+  /**
+   * 单条文件有效性判定（供 verifyFiles 并发调用）
+   *
+   * 永不抛异常：所有失败都折算成结果条目的 status，避免单条失败拖垮整批。
+   * @param {string} id - 文件 ID
+   * @param {Object} ctx - { isAdmin, ownerId, userType, request, objectStore, getFsContext, itemTimeoutMs }
+   * @returns {Promise<Object>} 单条检测结果
+   */
+  async _verifySingleFile(id, ctx) {
+    const { isAdmin, ownerId, userType, request, objectStore, getFsContext, itemTimeoutMs } = ctx;
+    const entry = { id: String(id), status: "error", message: null, size: null, storage_size: null };
+
+    const run = async () => {
+      const file = isAdmin
+        ? await this.fileRepository.findByIdWithStorageConfig(id)
+        : await this.fileRepository.findByIdAndCreator(id, ownerId);
+
+      if (!file) {
+        return { ...entry, status: "missing_record", message: "文件记录不存在或无权访问" };
+      }
+
+      entry.filename = file.filename;
+      entry.storage_config_id = file.storage_config_id || null;
+      entry.storage_path = file.storage_path || null;
+      entry.size = typeof file.size === "number" ? file.size : Number(file.size) || 0;
+
+      // 记录层：过期 / 超出查看次数
+      const access = this.validateFileAccess(file);
+      if (!access.accessible && access.reason === "expired") {
+        return { ...entry, status: "expired", message: "文件已过期或查看次数已用尽" };
+      }
+
+      // 存储层：storage-first 为主路径，file_path 作为回退
+      let info = null;
+      if (file.storage_config_id && file.storage_path) {
+        info = await objectStore.getInfoByStoragePath(file.storage_config_id, file.storage_path, { request });
+      } else if (file.file_path) {
+        const { fileSystem } = await getFsContext();
+        info = await fileSystem.getFileInfo(file.file_path, ownerId, userType, request);
+      } else {
+        return { ...entry, status: "error", message: "记录缺少存储路径，无法定位对象" };
+      }
+
+      const storageSize = info && typeof info.size === "number" ? info.size : null;
+      return {
+        ...entry,
+        status: "valid",
+        message: null,
+        storage_size: storageSize,
+        size_mismatch: storageSize !== null && entry.size > 0 && storageSize !== entry.size,
+        mimetype: info?.mimetype || null,
+      };
+    };
+
+    try {
+      return await withItemTimeout(run(), itemTimeoutMs, "存储响应超时，无法判定");
+    } catch (error) {
+      // 对象不存在 vs 存储不可达，必须区分：前者是失效文件，后者是判定失败
+      const notFound = error instanceof NotFoundError || error?.name === "NotFoundError";
+      return {
+        ...entry,
+        status: notFound ? "missing_object" : "error",
+        message: notFound ? "存储中已找不到该文件对象" : error?.message || "存储校验失败",
+      };
+    }
   }
 
   /**

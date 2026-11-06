@@ -56,13 +56,50 @@ export function useFileManagement(userType = "admin", { confirmFn } = {}) {
   const validityMap = reactive({});
   const verifying = ref(false);
 
+  // 分片参数：单次请求受后端并发上限与默认 30s 超时约束，
+  // 片内条数 × 单条最坏耗时必须留足余量，否则慢存储上整片会被掐断
+  const VERIFY_CHUNK_SIZE = 50;
+  const VERIFY_CHUNK_TIMEOUT_MS = 90000;
+
+  // 检测进度（分片循环里更新，供按钮与提示展示）
+  const verifyProgress = reactive({ done: 0, total: 0 });
+  // 最近一次汇总，便于 UI 展示数量与「选择失效文件」的可用性
+  const lastVerifySummary = ref(null);
+
   const clearValidity = () => {
     for (const key of Object.keys(validityMap)) {
       delete validityMap[key];
     }
+    verifyProgress.done = 0;
+    verifyProgress.total = 0;
+    lastVerifySummary.value = null;
   };
 
   const getValidityState = (fileId) => validityMap[fileId] || null;
+
+  /**
+   * 当前页检测出的失效文件数（对象缺失 / 记录缺失）
+   * 供「选择失效文件」按钮的文案使用
+   */
+  const invalidFileCount = computed(
+    () =>
+      (files.value || []).filter((file) => {
+        const state = validityMap[file.id];
+        return state && (state.status === "missing_object" || state.status === "missing_record");
+      }).length
+  );
+
+  /**
+   * 检测范围内（可能跨页）的失效总数
+   * 按钮禁用态看它：跨页失效时也应允许点击，再由提示说明需翻页
+   */
+  const invalidTotalCount = computed(
+    () =>
+      Object.keys(validityMap).filter((id) => {
+        const state = validityMap[id];
+        return state && (state.status === "missing_object" || state.status === "missing_record");
+      }).length
+  );
 
   /**
    * 加载文件列表
@@ -162,9 +199,13 @@ export function useFileManagement(userType = "admin", { confirmFn } = {}) {
   /**
    * 检测文件有效性（回到存储侧确认对象是否仍存在）
    * - 有选中项则只检测选中项，否则检测当前页全部
+   * - 分片提交，每片独立超时：单请求超时上限由后端并发数决定，
+   *   片内条数受控才不会因为一个慢存储把整批拖到请求超时
    * - 结果写入 validityMap，供表格状态列展示
    */
   const handleVerifyFiles = async () => {
+    if (verifying.value) return;
+
     const selected = base.selectedItems.value || [];
     const targets = selected.length > 0 ? selected : files.value.map((file) => file.id);
 
@@ -174,12 +215,31 @@ export function useFileManagement(userType = "admin", { confirmFn } = {}) {
     }
 
     verifying.value = true;
-    try {
-      const data = await fileshareService.verifyFiles(targets);
-      const results = Array.isArray(data?.results) ? data.results : [];
-      const summary = data?.summary || {};
+    verifyProgress.total = targets.length;
+    verifyProgress.done = 0;
 
-      for (const item of results) {
+    const allResults = [];
+    const failedChunks = [];
+    let networkError = null;
+
+    try {
+      for (let start = 0; start < targets.length; start += VERIFY_CHUNK_SIZE) {
+        const chunk = targets.slice(start, start + VERIFY_CHUNK_SIZE);
+        try {
+          const data = await fileshareService.verifyFiles(chunk, { timeout: VERIFY_CHUNK_TIMEOUT_MS });
+          const results = Array.isArray(data?.results) ? data.results : [];
+          allResults.push(...results);
+        } catch (error) {
+          // 单片失败不终止整批：记录失败 ID，按“无法判定”处理，不谎报文件丢失
+          networkError = error;
+          failedChunks.push({ ids: chunk, message: error?.message || "检测请求失败" });
+          log.error(`检测分片失败（${chunk.length} 个）:`, error);
+        } finally {
+          verifyProgress.done = Math.min(verifyProgress.done + chunk.length, targets.length);
+        }
+      }
+
+      for (const item of allResults) {
         if (!item?.id) continue;
         validityMap[item.id] = {
           status: item.status,
@@ -190,22 +250,97 @@ export function useFileManagement(userType = "admin", { confirmFn } = {}) {
         };
       }
 
-      const invalidCount = (summary.invalid || 0) + (summary.expired || 0);
+      for (const failed of failedChunks) {
+        for (const id of failed.ids) {
+          validityMap[id] = {
+            status: "error",
+            message: failed.message,
+            sizeMismatch: false,
+            storageSize: null,
+            checkedAt: Date.now(),
+          };
+        }
+      }
+
+      const summary = {
+        total: allResults.length + failedChunks.reduce((sum, item) => sum + item.ids.length, 0),
+        valid: allResults.filter((r) => r.status === "valid").length,
+        invalid: allResults.filter((r) => r.status === "missing_object" || r.status === "missing_record").length,
+        expired: allResults.filter((r) => r.status === "expired").length,
+        error: allResults.filter((r) => r.status === "error").length + failedChunks.reduce((sum, item) => sum + item.ids.length, 0),
+      };
+      lastVerifySummary.value = summary;
+
+      const invalidCount = summary.invalid + summary.expired;
       if (invalidCount > 0) {
-        base.showError(`检测完成：正常 ${summary.valid || 0} 个，失效/过期 ${invalidCount} 个，异常 ${summary.error || 0} 个`);
-      } else if ((summary.error || 0) > 0) {
-        base.showError(`检测完成：正常 ${summary.valid || 0} 个，异常 ${summary.error || 0} 个（存储不可达，无法判定）`);
+        base.showError(
+          `检测完成：正常 ${summary.valid} 个，失效/过期 ${invalidCount} 个，异常 ${summary.error} 个${
+            summary.invalid > 0 ? "（可用「选择失效文件」一键勾选）" : ""
+          }`
+        );
+      } else if (summary.error > 0) {
+        base.showError(`检测完成：正常 ${summary.valid} 个，异常 ${summary.error} 个（存储不可达，无法判定）`);
       } else {
-        base.showSuccess(`检测完成：${summary.valid || results.length} 个文件均有效`);
+        base.showSuccess(`检测完成：${summary.valid || targets.length} 个文件均有效`);
       }
 
       log.info("文件有效性检测完成:", summary);
+      if (networkError && failedChunks.length > 0) {
+        log.warn("部分分片检测失败:", failedChunks.map((item) => item.message).join("; "));
+      }
     } catch (error) {
       log.error("检测文件有效性失败:", error);
       base.showError(error.message || "检测文件有效性失败");
     } finally {
       verifying.value = false;
+      verifyProgress.done = 0;
+      verifyProgress.total = 0;
     }
+  };
+
+  /**
+   * 一键选择失效文件
+   * - 只勾选当前页里状态为「对象缺失 / 记录缺失」的文件（勾选态只对当前页可见，跨页勾选无意义）
+   * - 已过期是记录层限制而非对象丢失，单独统计，避免误删仍可恢复的对象
+   * @returns {number} 本次选中的文件数量
+   */
+  const selectInvalidFiles = () => {
+    const invalidIds = files.value
+      .filter((file) => {
+        const state = validityMap[file.id];
+        return state && (state.status === "missing_object" || state.status === "missing_record");
+      })
+      .map((file) => file.id);
+
+    if (invalidIds.length === 0) {
+      const otherPages = Object.keys(validityMap).filter((id) => {
+        const state = validityMap[id];
+        return state && (state.status === "missing_object" || state.status === "missing_record");
+      }).length;
+      base.showError(
+        otherPages > 0
+          ? `当前页没有失效文件；检测结果中另有 ${otherPages} 个失效文件在其他页，请翻页后再选择`
+          : "当前页没有检测出的失效文件"
+      );
+      return 0;
+    }
+
+    // 统计检测范围内全部失效数，提示跨页未勾选的部分，避免误以为已全选
+    const totalInvalid = Object.keys(validityMap).filter((id) => {
+      const state = validityMap[id];
+      return state && (state.status === "missing_object" || state.status === "missing_record");
+    }).length;
+
+    base.clearSelection();
+    base.selectedItems.value = invalidIds;
+    if (totalInvalid > invalidIds.length) {
+      base.showSuccess(
+        `已选择当前页 ${invalidIds.length} 个失效文件；另有 ${totalInvalid - invalidIds.length} 个在其他页，翻页后可再次选择`
+      );
+    } else {
+      base.showSuccess(`已选择 ${invalidIds.length} 个失效文件，可继续批量删除`);
+    }
+    return invalidIds.length;
   };
 
   /**
@@ -600,8 +735,13 @@ export function useFileManagement(userType = "admin", { confirmFn } = {}) {
     // 文件有效性检测
     validityMap,
     verifying,
+    verifyProgress,
+    lastVerifySummary,
+    invalidFileCount,
+    invalidTotalCount,
     getValidityState,
     clearValidity,
+    selectInvalidFiles,
 
     // 文件管理方法
     loadFiles,

@@ -37,6 +37,17 @@
         <div class="text-sm text-gray-600 dark:text-gray-400">
           共 {{ pagination.total }} 个文件
           <span v-if="selectedFiles.length > 0" class="ml-2"> (已选择 {{ selectedFiles.length }} 个) </span>
+          <span v-if="verifying && verifyProgress.total > 0" class="ml-2 text-blue-600 dark:text-blue-400">
+            · 正在检测 {{ verifyProgress.done }}/{{ verifyProgress.total }}
+          </span>
+          <span
+            v-else-if="lastVerifySummary && lastVerifySummary.total > 0"
+            class="ml-2"
+            :class="lastVerifySummary.invalid > 0 ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400'"
+          >
+            · 有效 {{ lastVerifySummary.valid }} / 失效 {{ lastVerifySummary.invalid }} / 过期 {{ lastVerifySummary.expired }} / 异常
+            {{ lastVerifySummary.error }}
+          </span>
         </div>
         <div class="flex flex-wrap gap-1 sm:gap-2">
           <!-- 删除模式开关 -->
@@ -76,6 +87,28 @@
               检测有效性{{ verifying ? "..." : selectedFiles.length > 0 ? ` (${selectedFiles.length})` : "" }}
             </span>
             <span class="xs:hidden">检测</span>
+          </button>
+
+          <!-- 一键选择失效文件按钮 -->
+          <button
+            type="button"
+            @click.prevent="selectInvalidFiles"
+            :disabled="verifying || invalidTotalCount === 0"
+            :class="[
+              'inline-flex items-center px-2 py-1 sm:px-3 sm:py-1.5 md:px-4 md:py-2 border border-transparent text-xs sm:text-sm font-medium rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 flex-grow sm:flex-grow-0',
+              verifying || invalidTotalCount === 0
+                ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                : 'text-white bg-amber-600 hover:bg-amber-700 focus:ring-amber-500',
+            ]"
+            :title="
+              invalidTotalCount === 0
+                ? '先检测有效性；检测出对象缺失的文件后可用此按钮一键勾选'
+                : `勾选检测出的 ${invalidTotalCount} 个失效文件（当前页 ${invalidFileCount} 个）`
+            "
+          >
+            <IconCheckbox class="h-3 w-3 sm:h-4 sm:w-4 mr-1" />
+            <span class="hidden xs:inline">选择失效文件{{ invalidTotalCount > 0 ? ` (${invalidTotalCount})` : "" }}</span>
+            <span class="xs:hidden">{{ invalidTotalCount > 0 ? `失效 ${invalidTotalCount}` : "失效" }}</span>
           </button>
 
           <!-- 批量删除按钮 -->
@@ -180,7 +213,7 @@ import { useI18n } from "vue-i18n";
 import { useFileManagement } from "@/modules/fileshare/admin/useFileManagement.js";
 import { useThemeMode } from "@/composables/core/useThemeMode.js";
 import { useConfirmDialog, createConfirmFn } from "@/composables/core/useConfirmDialog.js";
-import { IconClock, IconDelete, IconRefresh, IconShieldCheck } from "@/components/icons";
+import { IconCheckbox, IconClock, IconDelete, IconRefresh, IconShieldCheck } from "@/components/icons";
 import { useDeleteSettingsStore } from "@/stores/deleteSettingsStore.js";
 
 // 导入子组件
@@ -245,7 +278,12 @@ const {
   // 文件有效性检测
   validityMap,
   verifying,
+  verifyProgress,
+  lastVerifySummary,
+  invalidFileCount,
+  invalidTotalCount,
   handleVerifyFiles,
+  selectInvalidFiles,
 
   // 方法
   loadFiles,

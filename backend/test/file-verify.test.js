@@ -323,3 +323,103 @@ test("驱动既无 getFileInfo 也无 exists → ValidationError（不谎报有�
     restore();
   }
 });
+
+// ---------------------------------------------------------------------------
+// 批量检测的并发与超时保护
+// - 串行 for 循环在慢存储上会累加超过前端 30s 超时，必须并发执行
+// - 单条卡死不能拖垮整批，必须有单条超时兜底（归为 error，不谎报丢失）
+// ---------------------------------------------------------------------------
+
+test("批量检测并发执行：不按输入顺序串行等待", async () => {
+  const records = ["a", "b", "c", "d"].map((id) => ({ ...baseRecord, id, storage_path: `p/${id}` }));
+  const ctx = createService({
+    records,
+    storageBehavior: async (_cfg, key) => {
+      // 每条 60ms：串行需要 ~240ms，并发应显著更快
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return { size: 10 };
+    },
+  });
+  try {
+    const startedAt = Date.now();
+    const { results, summary } = await ctx.service.verifyFiles(["a", "b", "c", "d"], { concurrency: 4 });
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(summary.valid, 4);
+    assert.deepEqual(
+      results.map((r) => r.id),
+      ["a", "b", "c", "d"],
+      "并发实现仍必须保持输入顺序"
+    );
+    assert.ok(elapsed < 200, `并发执行应明显快于串行（实测 ${elapsed}ms）`);
+  } finally {
+    ctx.restore();
+  }
+});
+
+test("并发上限生效：同时在途的读请求不超过 concurrency", async () => {
+  const records = ["a", "b", "c", "d", "e", "f"].map((id) => ({ ...baseRecord, id, storage_path: `p/${id}` }));
+  let inFlight = 0;
+  let peak = 0;
+  const ctx = createService({
+    records,
+    storageBehavior: async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      inFlight -= 1;
+      return { size: 10 };
+    },
+  });
+  try {
+    const { summary } = await ctx.service.verifyFiles(["a", "b", "c", "d", "e", "f"], { concurrency: 2 });
+    assert.equal(summary.valid, 6);
+    assert.ok(peak <= 2, `并发上限应限制在 2，实测峰值 ${peak}`);
+  } finally {
+    ctx.restore();
+  }
+});
+
+test("单条存储卡死 → 该条记 error（超时），其余照常返回", async () => {
+  const records = [
+    { ...baseRecord, id: "fast", storage_path: "p/fast" },
+    { ...baseRecord, id: "slow", storage_path: "p/slow" },
+  ];
+  const ctx = createService({
+    records,
+    storageBehavior: (_cfg, key) => {
+      if (key === "p/slow") return new Promise(() => {}); // 永不 resolve
+      return { size: 10 };
+    },
+  });
+  try {
+    const { results, summary } = await ctx.service.verifyFiles(["fast", "slow"], {
+      concurrency: 2,
+      itemTimeoutMs: 80,
+    });
+
+    const fast = results.find((r) => r.id === "fast");
+    const slow = results.find((r) => r.id === "slow");
+    assert.equal(fast.status, "valid");
+    assert.equal(slow.status, "error", "超时不得被误判为 missing_object");
+    assert.equal(slow.message, "存储响应超时，无法判定");
+    assert.equal(summary.valid, 1);
+    assert.equal(summary.error, 1);
+    assert.equal(summary.invalid, 0);
+  } finally {
+    ctx.restore();
+  }
+});
+
+test("concurrency 参数非法时回退默认值（不因 0 或负数卡死整批）", async () => {
+  const records = [{ ...baseRecord, id: "f1" }];
+  for (const bad of [0, -3, undefined]) {
+    const ctx = createService({ records });
+    try {
+      const { summary } = await ctx.service.verifyFiles(["f1"], { concurrency: bad });
+      assert.equal(summary.valid, 1, `concurrency=${bad} 时仍应完成检测`);
+    } finally {
+      ctx.restore();
+    }
+  }
+});

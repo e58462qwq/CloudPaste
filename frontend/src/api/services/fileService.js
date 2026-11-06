@@ -176,11 +176,16 @@ export async function batchDeleteFiles(ids, deleteMode = "both") {
 
 /**
  * 批量检测文件有效性（校验记录对应的存储对象是否仍存在）
+ *
+ * 存储侧校验是网络往返，单个文件在慢存储上也可能耗时数秒，
+ * 调用方应传入足够的 timeout 并自行分片，避免落到默认 30s 超时。
+ *
  * @param {Array<string>} ids - 文件ID数组
+ * @param {Object} options - 透传给请求层，常用 { timeout }
  * @returns {Promise<Object>} 检测响应，data 为 { results, summary }
  */
-export async function verifyFiles(ids) {
-  return await post(`files/verify`, { ids });
+export async function verifyFiles(ids, options = {}) {
+  return await post(`files/verify`, { ids }, options);
 }
 
 /******************************************************************************
