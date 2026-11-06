@@ -7,6 +7,7 @@ import { useRepositories } from "../../utils/repositories.js";
 import { FileShareService } from "../../services/fileShareService.js";
 import { getEncryptionSecret } from "../../utils/environmentUtils.js";
 import { usePolicy } from "../../security/policies/policies.js";
+import { getSearchMinQueryLength } from "../../storage/fs/search/dialects/index.js";
 
 const parseJsonBody = async (c, next) => {
   const body = await c.req.json();
@@ -72,8 +73,9 @@ export const registerSearchShareRoutes = (router, helpers) => {
     const userInfo = c.get("userInfo");
     const { userIdOrInfo, userType } = getServiceParams(userInfo);
 
-    if (!searchParams.query || searchParams.query.trim().length < 3) {
-      throw new ValidationError("搜索查询至少需要3个字符");
+    const minQueryLength = getSearchMinQueryLength(c.env || {});
+    if (!searchParams.query || searchParams.query.trim().length < minQueryLength) {
+      throw new ValidationError(`搜索查询至少需要${minQueryLength}个字符`);
     }
 
     const mountManager = new MountManager(db, encryptionSecret, repositoryFactory, { env: c.env });

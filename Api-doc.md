@@ -426,6 +426,31 @@ X-Custom-Auth-Key: <api_key>
     }
     ```
 
+#### 获取搜索配置
+
+- `GET /api/system/search-config`
+  - 描述：获取文件搜索的运行时配置（公共 API），供前端决定最小查询长度与提示文案
+  - 授权：无需授权
+  - 响应：
+    ```json
+    {
+      "code": 200,
+      "message": "获取搜索配置成功",
+      "data": {
+        "dialect": "sqlite",
+        "dialect_id": "sqlite-fts5-trigram",
+        "min_query_length": 3,
+        "contains_mode": "fts5-trigram"
+      },
+      "success": true
+    }
+    ```
+  - 说明：
+    - `dialect`：`sqlite` / `postgres` / `mysql`（由 `DB_PROVIDER` 或 `DB_DIALECT` 决定，未知回退 `sqlite`）
+    - `dialect_id`：搜索方言实现 ID，如 `sqlite-fts5-trigram` / `postgres-like-contains` / `mysql-like-contains`
+    - `min_query_length`：当前方言允许的最小查询字符数
+    - `contains_mode`：子串匹配方式，`fts5-trigram` / `ilike` / `like`
+
 ### 仪表盘统计
 
 - `GET /api/admin/dashboard/stats`
@@ -492,7 +517,7 @@ X-Custom-Auth-Key: <api_key>
     - `recommendedReason`：建议原因（可选）
       - `indexing` / `index_not_ready` / `dirty_pending` / `dirty_too_large`
   - 响应 hints：
-    - `hints.minQueryLength`：索引搜索最小字符数（当前为 3，trigram contains）
+    - `hints.minQueryLength`：索引搜索最小字符数（随数据库方言变化：sqlite=3；postgres/mysql=1，可用 `GET /api/system/search-config` 获取）
     - `hints.dirtyRebuildThreshold`：dirty 条目过大时建议 rebuild 的阈值（当前为 5000）
 
 #### 触发索引重建（全量）
@@ -1341,7 +1366,7 @@ X-Custom-Auth-Key: <api_key>
   - 描述：搜索文件和目录
   - 授权：需要管理员令牌或有文件权限的 API 密钥
   - 查询参数：
-    - `q` - 搜索关键词（必填，至少 3 个字符）
+    - `q` - 搜索关键词（必填，长度需 ≥ 当前方言的 `min_query_length`：sqlite 为 3，postgres/mysql 为 1）
     - `scope` - 搜索范围（可选，默认为"global"）：global / mount / directory
     - `mount_id` - 挂载点 ID（当 scope 为"mount"时必填）
     - `path` - 搜索路径（当 scope 为"directory"时必填）

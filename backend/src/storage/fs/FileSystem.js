@@ -37,6 +37,7 @@ import { jobTypeCatalog } from "./tasks/JobTypeCatalog.js";
 import { calculateSubPath, normalizeMountPath } from "./utils/MountResolver.js";
 import { normalizePath as normalizeFsPath } from "./utils/PathResolver.js";
 import { FsSearchIndexStore } from "./search/FsSearchIndexStore.js";
+import { getSearchMinQueryLength } from "./search/dialects/index.js";
 /**
  * 模块说明：
  * - 角色：FS 视图的门面层，连接路由/API 与底层存储驱动。
@@ -53,7 +54,9 @@ export class FileSystem {
   constructor(mountManager, env = null) {
     this.mountManager = mountManager;
     this.repositoryFactory = mountManager?.repositoryFactory ?? null;
-    this.env = env;
+    // env 未显式传入时回落到 MountManager 携带的运行时环境，
+    // 这样按 env 推导数据库方言（DB_PROVIDER / DB_DIALECT）不会在路由层漏传时退化成 sqlite
+    this.env = env ?? mountManager?.env ?? null;
     this._taskOrchestrator = null; // 懒加载的 TaskOrchestrator 实例
   }
 
@@ -368,9 +371,10 @@ export class FileSystem {
   async searchFiles(query, searchParams, userIdOrInfo, userType, accessibleMounts = null, options = {}) {
     const { scope = "global", mountId, path, limit = 50, cursor = null } = searchParams;
 
-    // 参数验证（trigram contains：统一最小长度=3）
-    if (!query || query.trim().length < 3) {
-      throw new ValidationError("搜索查询至少需要3个字符");
+    // 参数验证（最小长度随方言变化：SQLite trigram=3，Postgres/MySQL LIKE=1）
+    const minQueryLength = getSearchMinQueryLength(this.env || {});
+    if (!query || query.trim().length < minQueryLength) {
+      throw new ValidationError(`搜索查询至少需要${minQueryLength}个字符`);
     }
 
     if (!["global", "mount", "directory"].includes(scope)) {
@@ -490,7 +494,8 @@ export class FileSystem {
     }
 
     const allowedMountIds = targetMounts.map((m) => m?.id).filter(Boolean);
-    const store = new FsSearchIndexStore(this.mountManager?.db);
+    // 方言从 env 推导（DB_PROVIDER/DB_DIALECT），未配置时回退 sqlite
+    const store = new FsSearchIndexStore(this.mountManager?.db, { env: this.env || {} });
 
     const indexStates = await store.getIndexStates(allowedMountIds);
     const mountIndexStatusMap = new Map(
