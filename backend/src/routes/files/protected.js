@@ -10,7 +10,7 @@ import {
 import { invalidateFsCache } from "../../cache/invalidation.js";
 import { useRepositories } from "../../utils/repositories.js";
 import { ValidationError } from "../../http/errors.js";
-import { getEncryptionSecret } from "../../utils/environmentUtils.js";
+import { getEncryptionSecret, isCloudflareWorkerEnvironment } from "../../utils/environmentUtils.js";
 import { getPagination, jsonOk } from "../../utils/common.js";
 import { usePolicy } from "../../security/policies/policies.js";
 import { resolvePrincipal } from "../../security/helpers/principal.js";
@@ -18,6 +18,17 @@ import { resolvePrincipal } from "../../security/helpers/principal.js";
 const requireFilesAccess = usePolicy("files.manage");
 
 const getFilesPrincipal = (c) => resolvePrincipal(c, { allowedTypes: [UserType.ADMIN, UserType.API_KEY] });
+
+// 单次检测的条数上限
+// - 常规部署（Docker/Node）：200 条，受限于单请求耗时
+// - Cloudflare Workers：subrequest 有硬上限（免费 50 / 付费 1000），
+//   批量查库后每个文件仍要一次存储请求，再叠加鉴权等开销，
+//   200 条必然触发 "Too many subrequests by single Worker invocation"，
+//   因此收紧到 20 条，超出时明确提示而不是让整批变成"无法判定"。
+const VERIFY_MAX_IDS = 200;
+const VERIFY_MAX_IDS_WORKER = 20;
+
+const resolveVerifyMaxIds = () => (isCloudflareWorkerEnvironment() ? VERIFY_MAX_IDS_WORKER : VERIFY_MAX_IDS);
 
 export const registerFilesProtectedRoutes = (router) => {
   router.get("/api/files", requireFilesAccess, async (c) => {
@@ -158,45 +169,50 @@ export const registerFilesProtectedRoutes = (router) => {
     invalidateFsCache({ storageConfigId, reason: "files-batch-delete", db });
   }
 
-  return jsonOk(c, result, `批量删除完成，成功: ${result.success}，失败: ${result.failed.length}`);
-});
-
-/**
- * 批量检测文件有效性
- * - 逐条回到存储侧确认对象是否仍存在，区分“对象缺失”与“存储不可达”
- * - 只读接口，不修改任何记录
- */
-router.post("/api/files/verify", requireFilesAccess, async (c) => {
-  const db = c.env.DB;
-  const { type: userType, userId } = getFilesPrincipal(c);
-  const body = await c.req.json().catch(() => ({}));
-  const ids = body?.ids;
-
-  if (!ids || !Array.isArray(ids) || ids.length === 0) {
-    throw new ValidationError("请提供有效的文件ID数组");
-  }
-  if (ids.length > 200) {
-    throw new ValidationError("单次最多检测 200 个文件");
-  }
-
-  const encryptionSecret = getEncryptionSecret(c);
-  const repositoryFactory = useRepositories(c);
-
-  const result = await verifyFiles(db, ids, encryptionSecret, {
-    userType,
-    userId,
-    request: c.req.raw,
-    env: c.env,
-    repositoryFactory,
+    return jsonOk(c, result, `批量删除完成，成功: ${result.success}，失败: ${result.failed.length}`);
   });
 
-  const { summary } = result;
-  return jsonOk(
-    c,
-    result,
-    `检测完成，共 ${summary.total} 个：正常 ${summary.valid}，失效 ${summary.invalid}，过期 ${summary.expired}，异常 ${summary.error}`
-  );
-});
+  /**
+   * 批量检测文件有效性
+   * - 逐条回到存储侧确认对象是否仍存在，区分“对象缺失”与“存储不可达”
+   * - 只读接口，不修改任何记录
+   */
+  router.post("/api/files/verify", requireFilesAccess, async (c) => {
+    const db = c.env.DB;
+    const { type: userType, userId } = getFilesPrincipal(c);
+    const body = await c.req.json().catch(() => ({}));
+    const ids = body?.ids;
+
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      throw new ValidationError("请提供有效的文件ID数组");
+    }
+
+    const maxIds = resolveVerifyMaxIds();
+    if (ids.length > maxIds) {
+      // Worker 上不能只提示“太多”，要让调用方知道如何分批：给明确上限与建议
+      throw new ValidationError(
+        `单次最多检测 ${maxIds} 个文件${maxIds < VERIFY_MAX_IDS ? "（Cloudflare Workers 单次请求 subrequest 配额有限，请分批检测）" : ""}`
+      );
+    }
+
+    const encryptionSecret = getEncryptionSecret(c);
+    const repositoryFactory = useRepositories(c);
+
+    const result = await verifyFiles(db, ids, encryptionSecret, {
+      userType,
+      userId,
+      request: c.req.raw,
+      env: c.env,
+      repositoryFactory,
+    });
+
+    const { summary } = result;
+    return jsonOk(
+      c,
+      result,
+      `检测完成，共 ${summary.total} 个：正常 ${summary.valid}，失效 ${summary.invalid}，过期 ${summary.expired}，异常 ${summary.error}`
+    );
+  });
 
   router.put("/api/files/:id", requireFilesAccess, async (c) => {
     const db = c.env.DB;

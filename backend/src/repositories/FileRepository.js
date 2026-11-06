@@ -118,6 +118,68 @@ export class FileRepository extends BaseRepository {
   }
 
   /**
+   * 按 ID 集合批量查找文件并关联存储配置（一次查询，避免逐条打库）
+   *
+   * 为什么需要：Worker 单次 invocation 的 subrequest 有硬上限，
+   * 批量检测若逐条 `WHERE f.id = ?`，200 条就是 200 次 D1 请求，
+   * 叠加存储请求会直接撞 "Too many subrequests"。这里压成 1 次。
+   *
+   * @param {Array<string>} fileIds - 文件ID数组
+   * @param {Object} options - { createdBy }：传入时只返回该创建者的记录（API_KEY 场景）
+   * @returns {Promise<Array<Object>>} 文件数组（顺序不保证，调用方按 id 建映射）
+   */
+  async findByIdsWithStorageConfig(fileIds, options = {}) {
+    const ids = Array.isArray(fileIds) ? fileIds.filter((id) => Boolean(id)) : [];
+    if (ids.length === 0) return [];
+
+    const { createdBy = null } = options || {};
+    const placeholders = ids.map(() => "?").join(",");
+    const params = [...ids];
+    let createdByClause = "";
+    if (createdBy) {
+      createdByClause = " AND f.created_by = ?";
+      params.push(createdBy);
+    }
+
+    const result = await this.query(
+      `
+      SELECT
+        f.*,
+        CASE
+          WHEN f.storage_type = 'S3' THEN json_extract(s.config_json,'$.endpoint_url')
+          ELSE NULL
+        END as endpoint_url,
+        CASE
+          WHEN f.storage_type = 'S3' THEN json_extract(s.config_json,'$.bucket_name')
+          ELSE NULL
+        END as bucket_name,
+        CASE
+          WHEN f.storage_type = 'S3' THEN json_extract(s.config_json,'$.region')
+          ELSE NULL
+        END as region,
+        NULL as access_key_id,
+        NULL as secret_access_key,
+        CASE
+          WHEN f.storage_type = 'S3' THEN json_extract(s.config_json,'$.path_style')
+          ELSE NULL
+        END as path_style,
+        CASE
+          WHEN f.storage_type = 'S3'
+            THEN COALESCE(json_extract(s.config_json,'$.provider_type'), 'S3')
+          ELSE s.storage_type
+        END as storage_provider_type,
+        s.name as storage_config_name
+      FROM ${DbTables.FILES} f
+      LEFT JOIN ${DbTables.STORAGE_CONFIGS} s ON f.storage_config_id = s.id
+      WHERE f.id IN (${placeholders})${createdByClause}
+      `,
+      params
+    );
+
+    return result?.results || [];
+  }
+
+  /**
    * 创建文件记录
    * @param {Object} fileData - 文件数据
    * @returns {Promise<Object>} 创建结果

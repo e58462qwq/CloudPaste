@@ -43,6 +43,20 @@ function normalizeConcurrency(value) {
   return Math.min(Math.max(raw, 1), VERIFY_MAX_CONCURRENCY);
 }
 
+// Worker 单次 invocation 的 subrequest 有硬上限（免费 50 / 付费 1000），
+// 批量检测每个文件至少要 1 次存储请求，超限后 Cloudflare 会直接抛出
+// "Too many subrequests by single Worker invocation"。
+// 这类失败是"整批都做不了"，不是"这几个文件丢了"，必须单独识别并上抛，
+// 让调用方（前端）减小批量后重试，而不是把每个文件都记成 error。
+const SUBREQUEST_LIMIT_MESSAGE = "Worker 单次请求配额不足（subrequests），请减小批量后重试";
+
+function isSubrequestLimitError(error) {
+  if (!error) return false;
+  if (error.name === "SubrequestLimitError") return true;
+  const message = String(error.message || "").toLowerCase();
+  return message.includes("too many subrequests") || message.includes("subrequests");
+}
+
 export class FileService {
   /**
    * 构造函数
@@ -55,6 +69,8 @@ export class FileService {
     this.encryptionSecret = encryptionSecret;
     this.repositoryFactory = ensureRepositoryFactory(db, repositoryFactory);
     this.fileRepository = new FileRepository(db);
+    // 批量预取存储配置失败一次后置位，后续批次直接走按需读取（避免重复刷日志）
+    this._storageConfigPrefetchDisabled = false;
   }
 
   /**
@@ -521,9 +537,16 @@ export class FileService {
     const ownerId = isAdmin ? userId : `apikey:${userId}`;
 
     // 空 id 直接跳过，但保留其余条目的输入顺序
-    const targets = (Array.isArray(ids) ? ids : []).filter((id) => Boolean(id));
+    const targets = (Array.isArray(ids) ? ids : []).filter((id) => Boolean(id)).map((id) => String(id));
 
     const objectStore = new ObjectStore(this.db, this.encryptionSecret, this.repositoryFactory);
+
+    // 先批量把记录与存储配置查好：
+    // Worker 的 subrequest 配额是硬上限，逐条查询会让 N 个文件消耗 2N+ 次请求，
+    // 批量后固定为 2 次（1 次文件记录 + 1 次存储配置），剩下的只有每个文件一次存储请求。
+    const uniqueTargets = Array.from(new Set(targets));
+    const filesById = await this._loadFilesForVerify(uniqueTargets, { isAdmin, ownerId });
+    const storageConfigsById = await this._loadStorageConfigsForVerify(filesById);
 
     let fsContext = null;
     const getFsContext = async () => {
@@ -535,7 +558,7 @@ export class FileService {
       return fsContext;
     };
 
-    const ctx = { isAdmin, ownerId, userType, request, objectStore, getFsContext, itemTimeoutMs };
+    const ctx = { isAdmin, ownerId, userType, request, objectStore, getFsContext, itemTimeoutMs, storageConfigsById };
 
     // 有界并发 + 结果按输入下标回填，保证返回顺序与请求一致
     const slots = new Array(targets.length);
@@ -546,7 +569,8 @@ export class FileService {
       while (cursor < targets.length) {
         const index = cursor;
         cursor += 1;
-        slots[index] = await this._verifySingleFile(targets[index], ctx);
+        const id = targets[index];
+        slots[index] = await this._verifySingleFile(id, ctx, filesById.get(id) || null);
       }
     };
 
@@ -567,44 +591,123 @@ export class FileService {
   }
 
   /**
+   * 批量加载待检测的文件记录（把 N 次单条查询压成 1 次）
+   * @param {Array<string>} ids - 去重后的文件 ID 列表
+   * @param {Object} options - { isAdmin, ownerId }
+   * @returns {Promise<Map<string, Object>>} id -> 文件记录
+   */
+  async _loadFilesForVerify(ids, { isAdmin, ownerId }) {
+    const map = new Map();
+    if (!ids || ids.length === 0) return map;
+
+    if (typeof this.fileRepository.findByIdsWithStorageConfig === "function") {
+      const rows = await this.fileRepository.findByIdsWithStorageConfig(ids, {
+        createdBy: isAdmin ? null : ownerId,
+      });
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (row && row.id) map.set(String(row.id), row);
+      }
+      return map;
+    }
+
+    // 仓储未提供批量方法时退回逐条（保持兼容，但会多消耗 subrequest）
+    for (const id of ids) {
+      const row = isAdmin
+        ? await this.fileRepository.findByIdWithStorageConfig(id)
+        : await this.fileRepository.findByIdAndCreator(id, ownerId);
+      if (row) map.set(String(id), row);
+    }
+    return map;
+  }
+
+  /**
+   * 批量加载本次检测涉及的存储配置（含密钥）
+   * @param {Map<string, Object>} filesById - 文件记录映射
+   * @returns {Promise<Map<string, Object>>} storage_config_id -> 存储配置
+   */
+  async _loadStorageConfigsForVerify(filesById) {
+    const map = new Map();
+    const configIds = [];
+    for (const file of filesById.values()) {
+      const configId = file?.storage_config_id;
+      if (configId && !configIds.includes(configId)) configIds.push(configId);
+    }
+    if (configIds.length === 0) return map;
+
+    if (this._storageConfigPrefetchDisabled) return map;
+
+    const repo = this.repositoryFactory?.getStorageConfigRepository?.() || null;
+    if (!repo) return map;
+
+    // 预取只是省 subrequest 的优化：失败不影响判定结论，
+    // 退回让 getInfoByStoragePath 自己按需读取配置即可。
+    // 失败后置位标记，本实例后续批次不再重复尝试（避免每次都白跑一次并刷日志）。
+    try {
+      if (typeof repo.findByIdsWithSecrets === "function") {
+        const configs = await repo.findByIdsWithSecrets(configIds);
+        for (const config of Array.isArray(configs) ? configs : []) {
+          if (config && config.id) map.set(String(config.id), config);
+        }
+        return map;
+      }
+
+      for (const configId of configIds) {
+        const config = await repo.findByIdWithSecrets(configId);
+        if (config) map.set(String(configId), config);
+      }
+    } catch (error) {
+      this._storageConfigPrefetchDisabled = true;
+      console.warn("[FileService] 批量加载存储配置失败，回退到按需读取:", error?.message || error);
+    }
+    return map;
+  }
+
+  /**
    * 单条文件有效性判定（供 verifyFiles 并发调用）
    *
    * 永不抛异常：所有失败都折算成结果条目的 status，避免单条失败拖垮整批。
    * @param {string} id - 文件 ID
-   * @param {Object} ctx - { isAdmin, ownerId, userType, request, objectStore, getFsContext, itemTimeoutMs }
+   * @param {Object} ctx - { isAdmin, ownerId, userType, request, objectStore, getFsContext, itemTimeoutMs, storageConfigsById }
+   * @param {Object|null} file - 已批量查好的文件记录；undefined 表示调用方未预加载，需要自行查询
    * @returns {Promise<Object>} 单条检测结果
    */
-  async _verifySingleFile(id, ctx) {
-    const { isAdmin, ownerId, userType, request, objectStore, getFsContext, itemTimeoutMs } = ctx;
+  async _verifySingleFile(id, ctx, file = undefined) {
+    const { isAdmin, ownerId, userType, request, objectStore, getFsContext, itemTimeoutMs, storageConfigsById } = ctx;
     const entry = { id: String(id), status: "error", message: null, size: null, storage_size: null };
 
     const run = async () => {
-      const file = isAdmin
-        ? await this.fileRepository.findByIdWithStorageConfig(id)
-        : await this.fileRepository.findByIdAndCreator(id, ownerId);
+      let record = file;
+      if (record === undefined) {
+        record = isAdmin
+          ? await this.fileRepository.findByIdWithStorageConfig(id)
+          : await this.fileRepository.findByIdAndCreator(id, ownerId);
+      }
 
-      if (!file) {
+      if (!record) {
         return { ...entry, status: "missing_record", message: "文件记录不存在或无权访问" };
       }
 
-      entry.filename = file.filename;
-      entry.storage_config_id = file.storage_config_id || null;
-      entry.storage_path = file.storage_path || null;
-      entry.size = typeof file.size === "number" ? file.size : Number(file.size) || 0;
+      entry.filename = record.filename;
+      entry.storage_config_id = record.storage_config_id || null;
+      entry.storage_path = record.storage_path || null;
+      entry.size = typeof record.size === "number" ? record.size : Number(record.size) || 0;
 
       // 记录层：过期 / 超出查看次数
-      const access = this.validateFileAccess(file);
+      const access = this.validateFileAccess(record);
       if (!access.accessible && access.reason === "expired") {
         return { ...entry, status: "expired", message: "文件已过期或查看次数已用尽" };
       }
 
       // 存储层：storage-first 为主路径，file_path 作为回退
       let info = null;
-      if (file.storage_config_id && file.storage_path) {
-        info = await objectStore.getInfoByStoragePath(file.storage_config_id, file.storage_path, { request });
-      } else if (file.file_path) {
+      if (record.storage_config_id && record.storage_path) {
+        info = await objectStore.getInfoByStoragePath(record.storage_config_id, record.storage_path, {
+          request,
+          storageConfig: storageConfigsById?.get(String(record.storage_config_id)) || null,
+        });
+      } else if (record.file_path) {
         const { fileSystem } = await getFsContext();
-        info = await fileSystem.getFileInfo(file.file_path, ownerId, userType, request);
+        info = await fileSystem.getFileInfo(record.file_path, ownerId, userType, request);
       } else {
         return { ...entry, status: "error", message: "记录缺少存储路径，无法定位对象" };
       }
@@ -623,6 +726,12 @@ export class FileService {
     try {
       return await withItemTimeout(run(), itemTimeoutMs, "存储响应超时，无法判定");
     } catch (error) {
+      // Worker subrequest 配额被打满：这是"整批判定不了"，不是"文件丢了"，
+      // 必须抛出去让上层改小批量，不能伪装成 missing_object 引导用户删文件。
+      if (isSubrequestLimitError(error)) {
+        throw new ValidationError(SUBREQUEST_LIMIT_MESSAGE);
+      }
+
       // 对象不存在 vs 存储不可达，必须区分：前者是失效文件，后者是判定失败
       const notFound = error instanceof NotFoundError || error?.name === "NotFoundError";
       return {

@@ -322,7 +322,9 @@ export class ObjectStore {
    * - 对象不存在抛 NotFoundError；存储不可达抛驱动原始错误；调用方据此区分“缺失”与“故障”
    */
   async getInfoByStoragePath(storage_config_id, key, options = {}) {
-    const storageConfig = await this._getStorageConfig(storage_config_id);
+    // 批量场景可以传入已查好的配置，跳过 _getStorageConfig 的那次 D1 请求：
+    // Worker 的 subrequest 配额是硬上限，每文件多一次配置查询会成倍放大消耗
+    const storageConfig = options.storageConfig || (await this._getStorageConfig(storage_config_id));
     if (!storageConfig.storage_type) {
       throw new ValidationError("存储配置缺少 storage_type");
     }

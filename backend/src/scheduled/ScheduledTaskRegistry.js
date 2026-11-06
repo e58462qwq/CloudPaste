@@ -241,4 +241,23 @@ export function registerScheduledHandlers() {
         err,
       );
     });
+
+  // 6) 失效/过期文件清理（不默认创建 scheduled_jobs 记录，需管理员在任务列表里自建并确认试运行）
+  import("./tasks/CleanupInvalidFilesTask.js")
+    .then((mod) => {
+      const TaskCtor = mod.CleanupInvalidFilesTask;
+      if (TaskCtor) {
+        const taskInstance = new TaskCtor();
+        scheduledTaskRegistry.register(taskInstance);
+        console.log(
+          `[ScheduledTaskRegistry] 成功注册调度任务: ${taskInstance.id}`,
+        );
+      }
+    })
+    .catch((err) => {
+      console.warn(
+        "[ScheduledTaskRegistry] 注册 CleanupInvalidFilesTask 失败:",
+        err,
+      );
+    });
 }

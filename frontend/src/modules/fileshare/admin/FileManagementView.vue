@@ -43,9 +43,9 @@
           <span
             v-else-if="lastVerifySummary && lastVerifySummary.total > 0"
             class="ml-2"
-            :class="lastVerifySummary.invalid > 0 ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400'"
+            :class="lastVerifySummary.invalid + lastVerifySummary.expired > 0 ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400'"
           >
-            · 有效 {{ lastVerifySummary.valid }} / 失效 {{ lastVerifySummary.invalid }} / 过期 {{ lastVerifySummary.expired }} / 异常
+            · 有效 {{ lastVerifySummary.valid }} / 失效/过期 {{ lastVerifySummary.invalid + lastVerifySummary.expired }} / 异常
             {{ lastVerifySummary.error }}
           </span>
         </div>
@@ -89,7 +89,7 @@
             <span class="xs:hidden">检测</span>
           </button>
 
-          <!-- 一键选择失效文件按钮 -->
+          <!-- 一键选择失效/过期文件按钮 -->
           <button
             type="button"
             @click.prevent="selectInvalidFiles"
@@ -102,13 +102,13 @@
             ]"
             :title="
               invalidTotalCount === 0
-                ? '先检测有效性；检测出对象缺失的文件后可用此按钮一键勾选'
-                : `勾选检测出的 ${invalidTotalCount} 个失效文件（当前页 ${invalidFileCount} 个）`
+                ? '先检测有效性；检测出对象缺失或已过期的文件后可用此按钮一键勾选'
+                : `勾选检测出的 ${invalidTotalCount} 个失效/过期文件（当前页 ${invalidFileCount} 个）`
             "
           >
             <IconCheckbox class="h-3 w-3 sm:h-4 sm:w-4 mr-1" />
-            <span class="hidden xs:inline">选择失效文件{{ invalidTotalCount > 0 ? ` (${invalidTotalCount})` : "" }}</span>
-            <span class="xs:hidden">{{ invalidTotalCount > 0 ? `失效 ${invalidTotalCount}` : "失效" }}</span>
+            <span class="hidden xs:inline">选择失效/过期{{ invalidTotalCount > 0 ? ` (${invalidTotalCount})` : "" }}</span>
+            <span class="xs:hidden">{{ invalidTotalCount > 0 ? `失效/过期 ${invalidTotalCount}` : "失效/过期" }}</span>
           </button>
 
           <!-- 批量删除按钮 -->

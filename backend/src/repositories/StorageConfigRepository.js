@@ -67,6 +67,26 @@ export class StorageConfigRepository extends BaseRepository {
     return this._inflate(row, { withSecrets: true });
   }
 
+  /**
+   * 按 ID 集合批量取存储配置（含密钥）
+   *
+   * 用于文件有效性检测这类“一次要把几十条记录挨个回源”的场景：
+   * 逐条 findByIdWithSecrets 会把 Worker 的 subrequest 配额成倍消耗掉。
+   * @param {Array<string>} configIds - 存储配置ID数组
+   * @returns {Promise<Array<Object>>} 配置数组（顺序不保证，调用方按 id 建映射）
+   */
+  async findByIdsWithSecrets(configIds) {
+    const ids = Array.isArray(configIds) ? configIds.filter((id) => Boolean(id)) : [];
+    if (ids.length === 0) return [];
+
+    const placeholders = ids.map(() => "?").join(",");
+    const result = await this.query(
+      `SELECT * FROM ${DbTables.STORAGE_CONFIGS} WHERE id IN (${placeholders})`,
+      ids
+    );
+    return this._inflateList(result?.results || [], { withSecrets: true });
+  }
+
   async findByAdmin(adminId) {
     const rows = await this.findMany(DbTables.STORAGE_CONFIGS, { admin_id: adminId }, { orderBy: "name ASC" });
     return this._inflateList(rows);

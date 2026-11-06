@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 
 import { FileService } from "../src/services/fileService.js";
 import { ObjectStore } from "../src/storage/object/ObjectStore.js";
-import { NotFoundError } from "../src/http/errors.js";
+import { NotFoundError, ValidationError } from "../src/http/errors.js";
 import { UserType } from "../src/constants/index.js";
 
 /**
@@ -33,6 +33,13 @@ function createService({ records = [], storageBehavior = () => ({ size: 10 }) } 
     },
     async findByIdAndCreator(id, ownerId) {
       return records.find((row) => row.id === id && row.created_by === ownerId) || null;
+    },
+    async findByIdsWithStorageConfig(ids, options = {}) {
+      const { createdBy = null } = options || {};
+      return ids
+        .map((id) => records.find((row) => row.id === id) || null)
+        .filter(Boolean)
+        .filter((row) => (createdBy ? row.created_by === createdBy : true));
     },
   };
 
@@ -421,5 +428,81 @@ test("concurrency 参数非法时回退默认值（不因 0 或负数卡死整�
     } finally {
       ctx.restore();
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Cloudflare Workers subrequest 配额
+// - 配额打满是"整批判定不了"，不是"文件丢了"
+// - 必须上抛 ValidationError，让上层提示减小批量，而不是逐条记成 error/missing_object
+// ---------------------------------------------------------------------------
+
+test("存储层抛出 Too many subrequests → 整批抛 ValidationError，不伪装成文件丢失", async () => {
+  const records = [{ ...baseRecord, id: "f1", storage_path: "p/f1" }];
+  const ctx = createService({
+    records,
+    storageBehavior: () => {
+      const error = new Error("Too many subrequests by single Worker invocation");
+      throw error;
+    },
+  });
+  try {
+    await assert.rejects(
+      () => ctx.service.verifyFiles(["f1"]),
+      (error) => {
+        assert.ok(error instanceof ValidationError, "应抛 ValidationError");
+        assert.match(error.message, /subrequests/, "文案应点明 subrequest 配额");
+        return true;
+      }
+    );
+  } finally {
+    ctx.restore();
+  }
+});
+
+test("批量检测只做一次文件记录查询 + 一次存储配置查询（不随条数线性增长）", async () => {
+  const records = ["a", "b", "c", "d", "e"].map((id) => ({ ...baseRecord, id, storage_path: `p/${id}` }));
+
+  let batchCalls = 0;
+  let singleCalls = 0;
+  let configBatchCalls = 0;
+
+  const service = new FileService({ prepare: () => ({ bind: () => ({ first: async () => null }) }) }, "test-secret", {
+    getStorageConfigRepository: () => ({
+      async findByIdsWithSecrets(ids) {
+        configBatchCalls += 1;
+        return ids.map((id) => ({ id, storage_type: "S3", bucket_name: "b" }));
+      },
+      async findByIdWithSecrets() {
+        throw new Error("不应逐条查询存储配置");
+      },
+    }),
+  });
+
+  service.fileRepository = {
+    async findByIdWithStorageConfig() {
+      singleCalls += 1;
+      return null;
+    },
+    async findByIdAndCreator() {
+      singleCalls += 1;
+      return null;
+    },
+    async findByIdsWithStorageConfig(ids) {
+      batchCalls += 1;
+      return ids.map((id) => records.find((row) => row.id === id)).filter(Boolean);
+    },
+  };
+
+  const original = ObjectStore.prototype.getInfoByStoragePath;
+  ObjectStore.prototype.getInfoByStoragePath = async () => ({ size: 10 });
+  try {
+    const { summary } = await service.verifyFiles(["a", "b", "c", "d", "e"]);
+    assert.equal(summary.valid, 5);
+    assert.equal(batchCalls, 1, "文件记录应只批量查询一次");
+    assert.equal(singleCalls, 0, "不应退化为逐条查询");
+    assert.equal(configBatchCalls, 1, "存储配置应只批量查询一次");
+  } finally {
+    ObjectStore.prototype.getInfoByStoragePath = original;
   }
 });

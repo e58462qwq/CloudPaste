@@ -714,6 +714,29 @@ X-Custom-Auth-Key: <api_key>
   - 授权：需要管理员令牌
   - 参数：taskId - 作业 ID
 
+#### 可用任务类型（handlerId）
+
+`GET /api/admin/scheduled/types` 返回当前构建中注册的处理器；常见取值：
+
+| handlerId | 名称 | 类别 | 说明 |
+| --- | --- | --- | --- |
+| `cleanup_upload_sessions` | 清理分片上传会话 | maintenance | 标记过期会话、删除历史会话与分片 |
+| `scheduled_sync_copy` | 同步复制 | business | 按配置把对象复制到目标存储 |
+| `scheduled_fs_index_rebuild` | FS 搜索索引重建 | business | 全量重建索引 |
+| `scheduled_fs_index_apply_dirty` | FS 索引增量应用 | business | 消费 dirty 队列 |
+| `refresh_storage_usage_snapshots` | 刷新存储用量快照 | maintenance | 刷新各存储配置的已用/总量快照 |
+| `cleanup_invalid_files` | 清理失效/过期文件 | maintenance | 按记录层口径清理已过期或查看次数用尽的文件 |
+
+`cleanup_invalid_files` 的配置项：
+
+- `dryRun`（默认 `true`）：只统计命中数量、不写库。首次接入建议先保持开启确认口径。
+- `batchSize`（默认 `100`，1–500）/ `maxBatches`（默认 `5`，1–100）：分批与单次上限，剩余的下次继续。
+- `deleteExpired`（默认 `true`）：`expires_at` 早于当前时间的记录。
+- `deleteViewsExhausted`（默认 `true`）：`max_views` 非空且 `views > max_views` 的记录（与 `FileService.validateFileAccess` 完全一致；`views === max_views` 仍允许再看一次，不会被清理）。
+- `deleteStorageObject`（默认 `false`）/ `maxStorageDeletes`（默认 `50`）：开启后回源删除存储对象，需网络请求；Workers 部署建议不超过 20。存储删除失败的文件记录会被保留，避免产生无法再定位的孤儿对象；对象已被上游删除（`NotFoundError`）时照常清理记录。
+
+> 该任务与「文件管理 → 检测有效性 → 选择失效文件」使用同一口径（对象缺失 / 记录缺失 / 已过期），可在管理面板手动执行，也可配成 interval 或 cron 定时跑。
+
 ---
 
 ## 5. 文本分享 API
@@ -936,8 +959,9 @@ X-Custom-Auth-Key: <api_key>
       "ids": ["文件ID1", "文件ID2"]
     }
     ```
-    - 单次最多 200 个 ID
-  - 并发与超时：后端内部按 `concurrency`（默认 8，上限 32）并发校验，单条存储查询超过 15 秒即按 `error` 返回（文案「存储响应超时，无法判定」），因此一批 200 条的最坏耗时有上界；前端仍建议分片提交（每片 50 条、单片超时 90 秒），慢存储上不会因为整批累积等待而触发请求超时。
+    - 单次最多 200 个 ID；Cloudflare Workers 部署下为 20 个（subrequest 有硬上限：免费版 50 次、付费版 1000 次/次调用），超出会返回 400 并提示分批检测
+  - 并发与超时：后端内部按 `concurrency`（默认 8，上限 32）并发校验，单条存储查询超过 15 秒即按 `error` 返回（文案「存储响应超时，无法判定」），因此一批 200 条的最坏耗时有上界；前端仍建议分片提交（每片 20 条、单片超时 90 秒），慢存储上不会因为整批累积等待而触发请求超时。
+  - subrequest 预算：批量检测会先用 1 次查询取回全部文件记录、1 次查询取回涉及的存储配置（不再逐条查询），其余 subrequest 只用在每个文件的存储读请求上。若仍触发 Worker 配额，整批会返回 400 且 message 含 `subrequests`（「Worker 单次请求配额不足（subrequests），请减小批量后重试」）——这是配额不足而非文件丢失，减小批量重试即可。
   - 响应：
     ```json
     {
