@@ -925,6 +925,52 @@ X-Custom-Auth-Key: <api_key>
     ```
   - 响应：批量删除结果
 
+#### 批量检测文件有效性
+
+- `POST /api/files/verify`
+  - 描述：批量检测文件有效性，回到存储侧确认记录对应的对象是否仍然存在。只读接口，不修改任何记录。
+  - 授权：需要管理员令牌或有文件权限的 API 密钥（API 密钥只能检测自己创建的文件）
+  - 请求体：
+    ```json
+    {
+      "ids": ["文件ID1", "文件ID2"]
+    }
+    ```
+    - 单次最多 200 个 ID
+  - 响应：
+    ```json
+    {
+      "success": true,
+      "code": "OK",
+      "message": "检测完成，共 2 个：正常 1，失效 1，过期 0，异常 0",
+      "data": {
+        "results": [
+          {
+            "id": "文件ID1",
+            "status": "valid",
+            "message": null,
+            "size": 1024,
+            "storage_size": 1024,
+            "size_mismatch": false,
+            "mimetype": "text/plain"
+          },
+          {
+            "id": "文件ID2",
+            "status": "missing_object",
+            "message": "存储中已找不到该文件对象"
+          }
+        ],
+        "summary": { "total": 2, "valid": 1, "invalid": 1, "expired": 0, "error": 0 }
+      }
+    }
+    ```
+  - `status` 取值：
+    - `valid` - 记录正常且存储对象存在
+    - `expired` - 记录存在但已过期或查看次数已用尽（不再触发存储检查）
+    - `missing_object` - 记录存在但存储对象已不存在
+    - `missing_record` - 记录本身不存在或无权访问
+    - `error` - 存储不可达或驱动不支持等，无法判定（**不等于**文件丢失）
+
 ### 文件分享上传
 
 #### 预签名分享上传

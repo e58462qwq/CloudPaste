@@ -315,6 +315,50 @@ export class ObjectStore {
     });
   }
 
+  /**
+   * 按存储路径读取真实对象的元信息（storage-first）
+   * - 供「文件有效性检测」复用：记录存在 ≠ 对象存在，必须回到存储侧确认
+   * - 驱动未实现 getFileInfo 时退化为 exists 检查
+   * - 对象不存在抛 NotFoundError；存储不可达抛驱动原始错误；调用方据此区分“缺失”与“故障”
+   */
+  async getInfoByStoragePath(storage_config_id, key, options = {}) {
+    const storageConfig = await this._getStorageConfig(storage_config_id);
+    if (!storageConfig.storage_type) {
+      throw new ValidationError("存储配置缺少 storage_type");
+    }
+    const driver = await StorageFactory.createDriver(storageConfig.storage_type, storageConfig, this.encryptionSecret);
+
+    // storage-first 场景没有挂载点：合成一个只读桩，供驱动读取 storage_type 等元信息。
+    // id 保持 null，让驱动里 `if (db && mount.id)` 之类的“更新挂载最后使用时间”分支自然跳过，不产生额外写库。
+    const mountStub = {
+      id: null,
+      storage_type: storageConfig.storage_type,
+      storage_config_id: storageConfig.id ?? storage_config_id,
+    };
+
+    const ctx = {
+      path: key,
+      subPath: key,
+      mount: mountStub,
+      db: this.db,
+      request: options.request || null,
+    };
+
+    if (typeof driver.getFileInfo === "function") {
+      return await driver.getFileInfo(key, ctx);
+    }
+
+    if (typeof driver.exists === "function") {
+      const exists = await driver.exists(key, ctx);
+      if (!exists) {
+        throw new NotFoundError("文件不存在");
+      }
+      return { path: key, name: null, isDirectory: false, size: null, mimetype: null, modified: null };
+    }
+
+    throw new ValidationError("当前驱动不支持按存储路径校验");
+  }
+
   // 删除存储对象（storage-first）
   async deleteByStoragePath(storage_config_id, key, options = {}) {
     const storageConfig = await this._getStorageConfig(storage_config_id);

@@ -463,6 +463,109 @@ export class FileService {
   }
 
   /**
+   * 检测文件有效性（批量）
+   * 记录存在 ≠ 对象存在：逐条回到存储侧确认对象是否仍然可达
+   *
+   * 状态语义：
+   * - valid            记录正常且存储对象存在
+   * - expired          记录存在但已过期/超出查看次数（记录层不可再访问）
+   * - missing_object   记录存在但存储对象已不存在
+   * - missing_record   记录本身不存在或无权访问
+   * - error            存储不可达/鉴权失败等，无法判定（不等于文件丢失）
+   *
+   * @param {Array<string>} ids - 文件 ID 列表
+   * @param {Object} options - { userType, userId, request, env }
+   * @returns {Promise<Object>} { results, summary }
+   */
+  async verifyFiles(ids, options = {}) {
+    const { userType = UserType.ADMIN, userId = null, request = null, env = null } = options || {};
+    const isAdmin = userType !== UserType.API_KEY;
+    const ownerId = isAdmin ? userId : `apikey:${userId}`;
+
+    const results = [];
+    const objectStore = new ObjectStore(this.db, this.encryptionSecret, this.repositoryFactory);
+
+    let fsContext = null;
+    const getFsContext = async () => {
+      if (fsContext) return fsContext;
+      const { MountManager } = await import("../storage/managers/MountManager.js");
+      const { FileSystem } = await import("../storage/fs/FileSystem.js");
+      const mountManager = new MountManager(this.db, this.encryptionSecret, this.repositoryFactory, { env });
+      fsContext = { mountManager, fileSystem: new FileSystem(mountManager) };
+      return fsContext;
+    };
+
+    for (const id of ids) {
+      if (!id) continue;
+
+      const entry = { id: String(id), status: "error", message: null, size: null, storage_size: null };
+
+      try {
+        const file = isAdmin
+          ? await this.fileRepository.findByIdWithStorageConfig(id)
+          : await this.fileRepository.findByIdAndCreator(id, ownerId);
+
+        if (!file) {
+          results.push({ ...entry, status: "missing_record", message: "文件记录不存在或无权访问" });
+          continue;
+        }
+
+        entry.filename = file.filename;
+        entry.storage_config_id = file.storage_config_id || null;
+        entry.storage_path = file.storage_path || null;
+        entry.size = typeof file.size === "number" ? file.size : Number(file.size) || 0;
+
+        // 记录层：过期 / 超出查看次数
+        const access = this.validateFileAccess(file);
+        if (!access.accessible && access.reason === "expired") {
+          results.push({ ...entry, status: "expired", message: "文件已过期或查看次数已用尽" });
+          continue;
+        }
+
+        // 存储层：storage-first 为主路径，file_path 作为回退
+        let info = null;
+        if (file.storage_config_id && file.storage_path) {
+          info = await objectStore.getInfoByStoragePath(file.storage_config_id, file.storage_path, { request });
+        } else if (file.file_path) {
+          const { fileSystem } = await getFsContext();
+          info = await fileSystem.getFileInfo(file.file_path, ownerId, userType, request);
+        } else {
+          results.push({ ...entry, status: "error", message: "记录缺少存储路径，无法定位对象" });
+          continue;
+        }
+
+        const storageSize = info && typeof info.size === "number" ? info.size : null;
+        results.push({
+          ...entry,
+          status: "valid",
+          message: null,
+          storage_size: storageSize,
+          size_mismatch: storageSize !== null && entry.size > 0 && storageSize !== entry.size,
+          mimetype: info?.mimetype || null,
+        });
+      } catch (error) {
+        // 对象不存在 vs 存储不可达，必须区分：前者是失效文件，后者是判定失败
+        const notFound = error instanceof NotFoundError || error?.name === "NotFoundError";
+        results.push({
+          ...entry,
+          status: notFound ? "missing_object" : "error",
+          message: notFound ? "存储中已找不到该文件对象" : error?.message || "存储校验失败",
+        });
+      }
+    }
+
+    const summary = {
+      total: results.length,
+      valid: results.filter((r) => r.status === "valid").length,
+      invalid: results.filter((r) => r.status === "missing_object" || r.status === "missing_record").length,
+      expired: results.filter((r) => r.status === "expired").length,
+      error: results.filter((r) => r.status === "error").length,
+    };
+
+    return { results, summary };
+  }
+
+  /**
    * 获取文件详情（管理员）
    * @param {string} fileId - 文件ID
    * @param {string} encryptionSecret - 加密密钥
@@ -909,4 +1012,10 @@ export async function getUserFileDetail(db, fileId, apiKeyId, encryptionSecret, 
 export async function updateFile(db, fileId, updateData, userInfo) {
   const fileService = new FileService(db);
   return await fileService.updateFile(fileId, updateData, userInfo);
+}
+
+// 文件有效性检测导出函数（需要 encryptionSecret + repositoryFactory 才能建 ObjectStore）
+export async function verifyFiles(db, ids, encryptionSecret, options = {}) {
+  const fileService = new FileService(db, encryptionSecret, options.repositoryFactory || null);
+  return await fileService.verifyFiles(ids, options);
 }

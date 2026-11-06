@@ -11,6 +11,7 @@ import {
   updateFile as apiUpdateFile,
   batchDeleteFiles as apiBatchDeleteFiles,
   verifyFilePassword as apiVerifyFilePassword,
+  verifyFiles as apiVerifyFiles,
 } from "@/api/services/fileService.js";
 
 /** @typedef {import("@/types/fileshare").FileshareItem} FileshareItem */
@@ -191,6 +192,32 @@ export function useFileshareService() {
     return resp;
   };
 
+  /**
+   * 批量检测文件有效性
+   *
+   * 回到存储侧确认每个记录对应的对象是否仍存在。
+   * 返回体结构：{ success, code, message, data: { results, summary } }
+   *
+   * @param {Array<string>} ids
+   * @returns {Promise<{results: Array, summary: Object}>}
+   */
+  const verifyFiles = async (ids) => {
+    if (!Array.isArray(ids) || ids.length === 0) {
+      throw new Error("缺少要检测的文件 ID 列表");
+    }
+    const resp = await apiVerifyFiles(ids);
+    if (!resp) {
+      throw new Error("检测文件有效性失败");
+    }
+    if (typeof resp === "object" && "success" in resp) {
+      if (!resp.success) {
+        throw new Error(resp.message || "检测文件有效性失败");
+      }
+      return resp.data ?? { results: [], summary: {} };
+    }
+    return resp;
+  };
+
   return {
     fetchList,
     fetchById,
@@ -202,6 +229,7 @@ export function useFileshareService() {
     buildShareUrl,
     updateFileMetadata,
     deleteFiles,
+    verifyFiles,
     verifyFilePassword,
   };
 }

@@ -174,6 +174,15 @@ export async function batchDeleteFiles(ids, deleteMode = "both") {
   return await del(`files/batch-delete`, { ids, delete_mode: deleteMode });
 }
 
+/**
+ * 批量检测文件有效性（校验记录对应的存储对象是否仍存在）
+ * @param {Array<string>} ids - 文件ID数组
+ * @returns {Promise<Object>} 检测响应，data 为 { results, summary }
+ */
+export async function verifyFiles(ids) {
+  return await post(`files/verify`, { ids });
+}
+
 /******************************************************************************
  * 公共文件访问API
  ******************************************************************************/

@@ -5,6 +5,7 @@ import {
   getUserFileList,
   getUserFileDetail,
   updateFile,
+  verifyFiles,
 } from "../../services/fileService.js";
 import { invalidateFsCache } from "../../cache/invalidation.js";
 import { useRepositories } from "../../utils/repositories.js";
@@ -158,6 +159,43 @@ export const registerFilesProtectedRoutes = (router) => {
   }
 
   return jsonOk(c, result, `批量删除完成，成功: ${result.success}，失败: ${result.failed.length}`);
+});
+
+/**
+ * 批量检测文件有效性
+ * - 逐条回到存储侧确认对象是否仍存在，区分“对象缺失”与“存储不可达”
+ * - 只读接口，不修改任何记录
+ */
+router.post("/api/files/verify", requireFilesAccess, async (c) => {
+  const db = c.env.DB;
+  const { type: userType, userId } = getFilesPrincipal(c);
+  const body = await c.req.json().catch(() => ({}));
+  const ids = body?.ids;
+
+  if (!ids || !Array.isArray(ids) || ids.length === 0) {
+    throw new ValidationError("请提供有效的文件ID数组");
+  }
+  if (ids.length > 200) {
+    throw new ValidationError("单次最多检测 200 个文件");
+  }
+
+  const encryptionSecret = getEncryptionSecret(c);
+  const repositoryFactory = useRepositories(c);
+
+  const result = await verifyFiles(db, ids, encryptionSecret, {
+    userType,
+    userId,
+    request: c.req.raw,
+    env: c.env,
+    repositoryFactory,
+  });
+
+  const { summary } = result;
+  return jsonOk(
+    c,
+    result,
+    `检测完成，共 ${summary.total} 个：正常 ${summary.valid}，失效 ${summary.invalid}，过期 ${summary.expired}，异常 ${summary.error}`
+  );
 });
 
   router.put("/api/files/:id", requireFilesAccess, async (c) => {

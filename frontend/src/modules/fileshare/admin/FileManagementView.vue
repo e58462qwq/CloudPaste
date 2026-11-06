@@ -57,6 +57,27 @@
             </button>
           </div>
 
+          <!-- 检测有效性按钮 -->
+          <button
+            type="button"
+            @click.prevent="handleVerifyFiles"
+            :disabled="verifying || files.length === 0"
+            :class="[
+              'inline-flex items-center px-2 py-1 sm:px-3 sm:py-1.5 md:px-4 md:py-2 border border-transparent text-xs sm:text-sm font-medium rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 flex-grow sm:flex-grow-0',
+              verifying || files.length === 0
+                ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                : 'text-white bg-blue-600 hover:bg-blue-700 focus:ring-blue-500',
+            ]"
+            :title="selectedFiles.length > 0 ? '检测选中文件在存储中是否仍存在' : '检测当前页文件在存储中是否仍存在'"
+          >
+            <IconRefresh v-if="verifying" class="h-3 w-3 sm:h-4 sm:w-4 mr-1 animate-spin" />
+            <IconShieldCheck v-else class="h-3 w-3 sm:h-4 sm:w-4 mr-1" />
+            <span class="hidden xs:inline">
+              检测有效性{{ verifying ? "..." : selectedFiles.length > 0 ? ` (${selectedFiles.length})` : "" }}
+            </span>
+            <span class="xs:hidden">检测</span>
+          </button>
+
           <!-- 批量删除按钮 -->
           <button
             type="button"
@@ -99,6 +120,8 @@
           :selected-files="selectedFiles"
           :user-type="props.userType"
           :loading="loading || searchLoading"
+          :validity-map="validityMap"
+          :validity-checking="verifying"
           @toggle-select="toggleSelectItem"
           @toggle-select-all="toggleSelectAll"
           @edit="openEditModal"
@@ -157,7 +180,7 @@ import { useI18n } from "vue-i18n";
 import { useFileManagement } from "@/modules/fileshare/admin/useFileManagement.js";
 import { useThemeMode } from "@/composables/core/useThemeMode.js";
 import { useConfirmDialog, createConfirmFn } from "@/composables/core/useConfirmDialog.js";
-import { IconClock, IconDelete, IconRefresh } from "@/components/icons";
+import { IconClock, IconDelete, IconRefresh, IconShieldCheck } from "@/components/icons";
 import { useDeleteSettingsStore } from "@/stores/deleteSettingsStore.js";
 
 // 导入子组件
@@ -218,6 +241,11 @@ const {
   searchQuery,
   isSearchMode,
   searchLoading,
+
+  // 文件有效性检测
+  validityMap,
+  verifying,
+  handleVerifyFiles,
 
   // 方法
   loadFiles,

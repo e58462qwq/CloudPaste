@@ -51,8 +51,18 @@ export function useFileManagement(userType = "admin", { confirmFn } = {}) {
   const isSearchMode = ref(false);
   const searchLoading = ref(false);
 
+  // 文件有效性检测（记录存在 ≠ 存储对象存在，需回到存储侧确认）
+  // 结果只保存在当前视图，不写入 store，避免污染列表缓存
+  const validityMap = reactive({});
+  const verifying = ref(false);
 
+  const clearValidity = () => {
+    for (const key of Object.keys(validityMap)) {
+      delete validityMap[key];
+    }
+  };
 
+  const getValidityState = (fileId) => validityMap[fileId] || null;
 
   /**
    * 加载文件列表
@@ -66,6 +76,8 @@ export function useFileManagement(userType = "admin", { confirmFn } = {}) {
         });
         base.updatePagination(pagination, "offset");
         base.updateLastRefreshTime();
+        // 列表重新加载后旧的检测结果可能已失效，避免展示过期结论
+        clearValidity();
       } catch (error) {
         log.error("加载文件列表失败:", error);
         base.showError(error.message || "加载数据失败");
@@ -145,6 +157,55 @@ export function useFileManagement(userType = "admin", { confirmFn } = {}) {
         await loadFiles();
       }
     });
+  };
+
+  /**
+   * 检测文件有效性（回到存储侧确认对象是否仍存在）
+   * - 有选中项则只检测选中项，否则检测当前页全部
+   * - 结果写入 validityMap，供表格状态列展示
+   */
+  const handleVerifyFiles = async () => {
+    const selected = base.selectedItems.value || [];
+    const targets = selected.length > 0 ? selected : files.value.map((file) => file.id);
+
+    if (!targets || targets.length === 0) {
+      base.showError("当前没有可检测的文件");
+      return;
+    }
+
+    verifying.value = true;
+    try {
+      const data = await fileshareService.verifyFiles(targets);
+      const results = Array.isArray(data?.results) ? data.results : [];
+      const summary = data?.summary || {};
+
+      for (const item of results) {
+        if (!item?.id) continue;
+        validityMap[item.id] = {
+          status: item.status,
+          message: item.message || null,
+          sizeMismatch: item.size_mismatch === true,
+          storageSize: item.storage_size ?? null,
+          checkedAt: Date.now(),
+        };
+      }
+
+      const invalidCount = (summary.invalid || 0) + (summary.expired || 0);
+      if (invalidCount > 0) {
+        base.showError(`检测完成：正常 ${summary.valid || 0} 个，失效/过期 ${invalidCount} 个，异常 ${summary.error || 0} 个`);
+      } else if ((summary.error || 0) > 0) {
+        base.showError(`检测完成：正常 ${summary.valid || 0} 个，异常 ${summary.error || 0} 个（存储不可达，无法判定）`);
+      } else {
+        base.showSuccess(`检测完成：${summary.valid || results.length} 个文件均有效`);
+      }
+
+      log.info("文件有效性检测完成:", summary);
+    } catch (error) {
+      log.error("检测文件有效性失败:", error);
+      base.showError(error.message || "检测文件有效性失败");
+    } finally {
+      verifying.value = false;
+    }
   };
 
   /**
@@ -410,6 +471,8 @@ export function useFileManagement(userType = "admin", { confirmFn } = {}) {
           offset: searchOffset,
           search: searchTerm.trim(),
         });
+        // 搜索换了一批文件，旧的检测结果不再对应
+        clearValidity();
         return { files: results, pagination };
       } catch (error) {
         log.error("搜索文件失败:", error);
@@ -534,6 +597,12 @@ export function useFileManagement(userType = "admin", { confirmFn } = {}) {
     qrCodeDataURL,
     qrCodeSlug,
 
+    // 文件有效性检测
+    validityMap,
+    verifying,
+    getValidityState,
+    clearValidity,
+
     // 文件管理方法
     loadFiles,
     refreshFiles,
@@ -545,6 +614,7 @@ export function useFileManagement(userType = "admin", { confirmFn } = {}) {
     handlePageSizeChange,
     handleFileDelete,
     handleBatchDelete,
+    handleVerifyFiles,
     openEditModal,
     updateFileMetadata,
     openPreviewModal,

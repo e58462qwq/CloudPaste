@@ -142,6 +142,30 @@
             </div>
           </div>
 
+          <!-- 有效性 -->
+          <div class="col-span-2">
+            <div class="text-xs font-medium uppercase" :class="darkMode ? 'text-gray-500' : 'text-gray-500'">有效性</div>
+            <div class="flex flex-wrap items-center gap-2 mt-1">
+              <span
+                v-if="getValidityInfo(file).checked"
+                :class="getValidityInfo(file).className"
+              >
+                {{ getValidityInfo(file).label }}
+              </span>
+              <span v-else class="text-xs" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">{{ getValidityInfo(file).label }}</span>
+              <span
+                v-if="getValidityInfo(file).sizeMismatch"
+                class="text-xs"
+                :class="darkMode ? 'text-yellow-400' : 'text-yellow-600'"
+              >大小不符</span>
+              <span
+                v-if="getValidityInfo(file).message"
+                class="text-xs"
+                :class="darkMode ? 'text-gray-400' : 'text-gray-500'"
+              >{{ getValidityInfo(file).message }}</span>
+            </div>
+          </div>
+
           <!-- 创建时间 -->
           <div class="col-span-2">
             <div class="text-xs font-medium uppercase" :class="darkMode ? 'text-gray-500' : 'text-gray-500'">创建时间</div>
@@ -204,6 +228,15 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  // 有效性检测结果：{ [fileId]: { status, message, sizeMismatch, storageSize, checkedAt } }
+  validityMap: {
+    type: Object,
+    default: () => ({}),
+  },
+  validityChecking: {
+    type: Boolean,
+    default: false,
+  },
 });
 
 const isAdmin = computed(() => props.userType === "admin");
@@ -220,6 +253,56 @@ const emit = defineEmits([
 ]);
 
 const storageConfigsStore = useStorageConfigsStore();
+
+/**
+ * 有效性状态元信息
+ * valid 正常 / expired 过期 / missing_object 对象缺失 / missing_record 记录缺失 / error 无法判定
+ */
+const VALIDITY_META = {
+  valid: {
+    label: "有效",
+    className:
+      "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100",
+  },
+  expired: {
+    label: "已过期",
+    className:
+      "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-100",
+  },
+  missing_object: {
+    label: "对象缺失",
+    className: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-100",
+  },
+  missing_record: {
+    label: "记录缺失",
+    className: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-100",
+  },
+  error: {
+    label: "无法判定",
+    className:
+      "bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200",
+  },
+};
+
+const getValidityInfo = (file) => {
+  const state = props.validityMap?.[file.id];
+  if (!state) {
+    return {
+      label: props.validityChecking ? "检测中" : "未检测",
+      className: "",
+      message: null,
+      checked: false,
+    };
+  }
+  const meta = VALIDITY_META[state.status] || VALIDITY_META.error;
+  return {
+    label: meta.label,
+    className: `${meta.className} px-2 py-1 text-xs rounded inline-block`,
+    message: state.message || null,
+    sizeMismatch: state.sizeMismatch === true,
+    checked: true,
+  };
+};
 
 const getStorageConfigDisplay = (file) => {
   const typeLabel =
@@ -466,6 +549,56 @@ const fileColumns = computed(() => [
     },
   },
 
+  // 有效性状态列（检测后才有值，未检测显示“未检测”）
+  {
+    key: "validity",
+    type: "display",
+    header: "有效性",
+    sortable: false,
+    render: (file) => {
+      const info = getValidityInfo(file);
+      if (!info.checked) {
+        return h(
+          "span",
+          {
+            class: `text-xs ${props.darkMode ? "text-gray-500" : "text-gray-400"}`,
+          },
+          info.label
+        );
+      }
+
+      const children = [h("span", { class: info.className }, info.label)];
+
+      if (info.sizeMismatch) {
+        children.push(
+          h(
+            "span",
+            {
+              class: `text-xs mt-1 ${props.darkMode ? "text-yellow-400" : "text-yellow-600"}`,
+              title: "存储中对象的大小与记录不一致",
+            },
+            "大小不符"
+          )
+        );
+      }
+
+      if (info.message) {
+        children.push(
+          h(
+            "span",
+            {
+              class: `text-xs mt-1 ${props.darkMode ? "text-gray-400" : "text-gray-500"}`,
+              title: info.message,
+            },
+            info.message
+          )
+        );
+      }
+
+      return h("div", { class: "flex flex-col items-center" }, children);
+    },
+  },
+
   // 创建时间列
   {
     key: "created_at",
@@ -607,6 +740,7 @@ const fileColumnClasses = {
   remaining_views: "hidden xl:table-cell text-center",
   storage_config: "hidden lg:table-cell text-center",
   created_by: "hidden lg:table-cell text-center",
+  validity: "hidden md:table-cell text-center",
   created_at: "hidden sm:table-cell text-center",
   actions: "text-center",
 };
