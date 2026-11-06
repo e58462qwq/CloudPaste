@@ -118,10 +118,27 @@ export function createHttpStreamDescriptor({
     }
 
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(resolve, ms);
+      let onAbort = null;
+      const cleanup = () => {
+        if (onAbort && signal) {
+          try {
+            signal.removeEventListener("abort", onAbort);
+          } catch {}
+        }
+        onAbort = null;
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, ms);
+      // 不要让重试等待的定时器把 Node 进程/worker 的退出拖住
+      timer?.unref?.();
+
       if (!signal) return;
-      const onAbort = () => {
+
+      onAbort = () => {
         clearTimeout(timer);
+        cleanup();
         const abortError = new Error("Aborted");
         abortError.name = "AbortError";
         reject(abortError);

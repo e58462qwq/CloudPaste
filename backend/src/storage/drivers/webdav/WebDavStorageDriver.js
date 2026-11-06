@@ -23,6 +23,7 @@ import { updateUploadProgress, completeUploadProgress } from "../../utils/Upload
 import { isNodeJSEnvironment } from "../../../utils/environmentUtils.js";
 import { buildFileInfo } from "../../utils/FileInfoBuilder.js";
 import { createHttpStreamDescriptor } from "../../streaming/StreamDescriptorUtils.js";
+import { normalizeRangeFallbackPolicy } from "../../streaming/rangeFallbackPolicy.js";
 
 export class WebDavStorageDriver extends BaseDriver {
   constructor(config, encryptionSecret) {
@@ -38,6 +39,9 @@ export class WebDavStorageDriver extends BaseDriver {
     this.urlProxy = config.url_proxy || null;
     this.tlsSkipVerify = config?.tls_insecure_skip_verify === 1;
     this.enableDiskUsage = config?.enable_disk_usage === 1;
+    // Range 降级策略：上游忽略 Range 时如何响应。
+    // WebDAV 缺省 full（历史行为），可由存储配置 range_fallback_policy 覆盖为 software。
+    this.rangeFallbackPolicy = normalizeRangeFallbackPolicy(config?.range_fallback_policy, "full");
   }
 
   /**
@@ -82,9 +86,13 @@ export class WebDavStorageDriver extends BaseDriver {
       const agent =
         endpointForClient.startsWith("https://") && this.tlsSkipVerify ? new https.Agent({ rejectUnauthorized: false }) : undefined;
       const clientOptions = agent ? { httpsAgent: agent } : {};
+      // 不用 username/password 选项：webdav 客户端内部用 base-64 库编码，遇到非 Latin1 字符
+      // （中文用户名/密码）会抛 "The string to be encoded contains characters outside of the Latin1 range"。
+      // 这里直接给出按 UTF-8 编码的 Authorization 头。
       this.client = createClient(endpointForClient, {
-        username: this.username,
-        password,
+        headers: {
+          Authorization: this._basicAuthHeader(password),
+        },
         ...clientOptions,
       });
       this.initialized = true;
@@ -386,8 +394,8 @@ export class WebDavStorageDriver extends BaseDriver {
 
     // WebDAV 场景（尤其是 Cloudflare -> Cloudflare）里，Range 经常被上游/平台忽略，
     // 软件切片会导致“看似 206 但一直加载/黑屏”。
-    // 因此：WebDAV 若上游不支持 Range，就直接降级为 200 全量响应。
-    descriptor.rangeFallbackPolicy = "full";
+    // 因此 WebDAV 的默认策略是 full（直接降级 200），但允许存储配置覆盖为 software。
+    descriptor.rangeFallbackPolicy = this.rangeFallbackPolicy;
 
     return descriptor;
   }
@@ -917,12 +925,11 @@ export class WebDavStorageDriver extends BaseDriver {
     return `${base}${davPath}`;
   }
 
-  _basicAuthHeader() {
-    const raw = `${this.username}:${this.decryptedPassword || ""}`;
-    const encoded =
-      typeof btoa === "function"
-        ? btoa(raw)
-        : Buffer.from(raw).toString("base64");
+  _basicAuthHeader(passwordOverride = undefined) {
+    // 统一用 UTF-8 编码（RFC 7617 允许 charset=UTF-8）：
+    // btoa 只接受 Latin1，用户名/密码含中文时直接抛 "outside of the Latin1 range"。
+    const raw = `${this.username}:${passwordOverride ?? this.decryptedPassword ?? ""}`;
+    const encoded = Buffer.from(raw, "utf8").toString("base64");
     return `Basic ${encoded}`;
   }
 

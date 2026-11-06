@@ -48,6 +48,7 @@ export default {
       username: "Username",
       password: "Password",
       tls_insecure_skip_verify: "Skip TLS verification",
+      range_fallback_policy: "Range fallback policy",
 
       // S3 specific
       s3: {
@@ -283,6 +284,8 @@ export default {
       },
       webdav_endpoint: "Full access URL for the WebDAV service",
       tls_insecure_skip_verify: "Skip TLS certificate verification (insecure, for testing only)",
+      range_fallback_policy:
+        "How to respond when upstream ignores Range. Full: return the whole file with 200 (best compatibility, but seeking re-downloads the file); Software slice: read-and-discard to build a 206 (large offsets waste upstream bandwidth). WebDAV defaults to full.",
       root_path: "Root directory path for local file storage, must be an absolute path",
       readonly: "Enable read-only mode, disabling write and delete operations",
       local: {
@@ -443,6 +446,12 @@ export default {
         us: "US Government",
         de: "Germany",
       },
+    },
+
+    // Range fallback policy options
+    rangeFallbackPolicy: {
+      full: "Full (200)",
+      software: "Software slice (206)",
     },
   },
 };

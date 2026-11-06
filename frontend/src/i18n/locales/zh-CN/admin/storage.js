@@ -48,6 +48,7 @@ export default {
       username: "用户名",
       password: "密码",
       tls_insecure_skip_verify: "跳过 TLS 证书校验",
+      range_fallback_policy: "Range 降级策略",
 
       // S3 特有字段
       s3: {
@@ -287,6 +288,8 @@ export default {
       },
       webdav_endpoint: "WebDAV 服务的完整访问地址",
       tls_insecure_skip_verify: "跳过 TLS 证书验证（不安全，仅用于测试环境）",
+      range_fallback_policy:
+        "上游忽略 Range 时的兜底方式。全量（full）：直接返回 200 整文件，兼容性最好，但大文件拖动进度条会重新下载；软件切片（software）：边读边丢弃，能返回 206，但大偏移会消耗上游流量。WebDAV 默认全量。",
       root_path: "本地文件存储的根目录路径，例如 /data/local-files ",
       auto_create_root: "启用后，当本地根目录对应子目录不存在时会自动创建；默认关闭，需要手动在宿主机上创建子目录",
       readonly: "启用只读模式，禁止写入和删除操作",
@@ -437,6 +440,12 @@ export default {
         us: "美国政府版 (US Gov)",
         de: "德国版 (Germany)",
       },
+    },
+
+    // Range 降级策略选项
+    rangeFallbackPolicy: {
+      full: "全量（200）",
+      software: "软件切片（206）",
     },
   },
 };

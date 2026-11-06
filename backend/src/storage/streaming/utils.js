@@ -271,7 +271,12 @@ export function buildResponseHeaders(descriptor, range, channel) {
   }
 
   // Accept-Ranges
-  headers.set("Accept-Ranges", "bytes");
+  // 只有确实知道文件总长时才声明「支持 Range」：size 未知时本函数不会写任何
+  // 长度头，此时再发 Accept-Ranges: bytes 等于向客户端承诺可以按字节偏移取，
+  // 而服务端连总长都不知道 —— 后续 Range 只能靠探测或丢弃前缀，容易被判截断。
+  if (descriptor.size !== null) {
+    headers.set("Accept-Ranges", "bytes");
+  }
 
   // ETag
   if (descriptor.etag) {

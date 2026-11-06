@@ -9,6 +9,7 @@ import { invalidateFsCache } from "../cache/invalidation.js";
 import { FsSearchIndexStore } from "../storage/fs/search/FsSearchIndexStore.js";
 import { normalizeStorageTestResult, summarizeTestReportForLog } from "../storage/tester/StorageTestReport.js";
 import { toBool } from "../utils/environmentUtils.js";
+import { normalizeRangeFallbackPolicy } from "../storage/streaming/rangeFallbackPolicy.js";
 
 const DEFAULT_TOTAL_STORAGE_BYTES = 10 * 1024 * 1024 * 1024; // 10GB（字节）
 
@@ -323,6 +324,7 @@ export async function createStorageConfig(db, configData, adminId, encryptionSec
       password: encryptedPassword,
       default_folder: defaultFolder,
       tls_insecure_skip_verify: toBool(configData.tls_insecure_skip_verify, false) ? 1 : 0,
+      range_fallback_policy: normalizeRangeFallbackPolicy(configData.range_fallback_policy, "full"),
       total_storage_bytes: totalStorageBytesNormalized,
     };
     // enable_disk_usage：如果前端没传，交给 schema.defaultValue 决定（避免在 service 里写死）
@@ -433,6 +435,9 @@ export async function updateStorageConfig(db, id, updateData, adminId, encryptio
       let folder = (v || "").toString().trim();
       folder = folder.replace(/^\/+/, "");
       cfg.default_folder = folder;
+    } else if (k === "range_fallback_policy") {
+      // 白名单归一：只接受 software / full，其它值回落默认（避免脏值把流式层带进未定义分支）
+      cfg.range_fallback_policy = normalizeRangeFallbackPolicy(v, "full");
     } else {
       if (boolFieldSet.has(k)) {
         if (v === undefined || v === null) {

@@ -93,39 +93,53 @@ export function wrapStreamWithByteSlice(fullStream, start, end) {
     async pull(controller) {
       if (finished) return;
       try {
-        const { done, value } = await reader.read();
-        if (done) {
-          finished = true;
-          controller.close();
+        // 关键：一次 pull 必须“产出结果”（enqueue / close / error），不能空手返回。
+        // ReadableStream 的 pull 既不 enqueue 也不 close 时，运行时不会自动再次调用 pull，
+        // 整条流会永久挂起 —— start > 0 丢弃前缀块就是这条路径。
+        // 因此这里用 for (;;)：continue 跳过前缀块，return 表示本次 pull 已交付。
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            finished = true;
+            // 上游提前 EOF：承诺的字节没读够时必须报错，而不是静默 close，
+            // 否则响应体已声明 Content-Length，消费方会把残缺内容当成完整文件。
+            if (position <= end) {
+              controller.error(new Error(`byte slice ended at ${position} bytes but ${end + 1} bytes were promised`));
+            } else {
+              controller.close();
+            }
+            return;
+          }
+
+          const data = value instanceof Uint8Array ? value : new Uint8Array(value);
+          const chunkStart = position;
+          const chunkEnd = position + data.byteLength - 1;
+          position += data.byteLength;
+
+          // 整个 chunk 在范围之前：跳过并继续读（continue，绝不 return）
+          if (chunkEnd < start) {
+            continue;
+          }
+
+          if (chunkStart > end) {
+            finished = true;
+            await closeUpstream();
+            controller.close();
+            return;
+          }
+
+          const sliceStart = Math.max(0, start - chunkStart);
+          const sliceEnd = Math.min(data.byteLength, end - chunkStart + 1);
+          if (sliceStart < sliceEnd) {
+            controller.enqueue(data.subarray(sliceStart, sliceEnd));
+          }
+
+          if (chunkEnd >= end) {
+            finished = true;
+            await closeUpstream();
+            controller.close();
+          }
           return;
-        }
-
-        const data = value instanceof Uint8Array ? value : new Uint8Array(value);
-        const chunkStart = position;
-        const chunkEnd = position + data.byteLength - 1;
-        position += data.byteLength;
-
-        if (chunkEnd < start) {
-          return;
-        }
-
-        if (chunkStart > end) {
-          finished = true;
-          await closeUpstream();
-          controller.close();
-          return;
-        }
-
-        const sliceStart = Math.max(0, start - chunkStart);
-        const sliceEnd = Math.min(data.byteLength, end - chunkStart + 1);
-        if (sliceStart < sliceEnd) {
-          controller.enqueue(data.subarray(sliceStart, sliceEnd));
-        }
-
-        if (chunkEnd >= end) {
-          finished = true;
-          await closeUpstream();
-          controller.close();
         }
       } catch (e) {
         finished = true;
@@ -193,18 +207,40 @@ export function wrapNodeStreamWithByteSlice(nodeStream, start, end) {
           finished = true;
           nodeStream.destroy();
           controller.close();
+          return;
+        }
+
+        // 背压：队列已满时暂停上游，等下游 pull 时再恢复。
+        // 不加这一段时 "data" 事件会持续把大文件塞进内存队列。
+        if (typeof nodeStream.pause === "function" && controller.desiredSize !== null && controller.desiredSize <= 0) {
+          nodeStream.pause();
         }
       });
 
       nodeStream.on("end", () => {
-        if (!finished) {
+        if (finished) {
+          return;
+        }
+        finished = true;
+        // 与 Web 版一致：上游提前 EOF 且字节没给够时必须报错，不能静默 close。
+        if (position <= end) {
+          controller.error(new Error(`byte slice ended at ${position} bytes but ${end + 1} bytes were promised`));
+        } else {
           controller.close();
         }
       });
 
       nodeStream.on("error", (err) => {
+        finished = true;
         controller.error(err);
       });
+    },
+
+    // 下游消费后再恢复上游读取，形成背压闭环
+    pull() {
+      if (!finished && typeof nodeStream.resume === "function") {
+        nodeStream.resume();
+      }
     },
 
     cancel(reason) {

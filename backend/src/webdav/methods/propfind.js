@@ -583,11 +583,11 @@ export async function handlePropfind(c, path, userId, userType, db) {
           permissions: userId.permissions || {},
         };
       } else {
-        return createErrorResponse("/dav" + path, 401, "API密钥信息格式错误");
+        return createErrorResponse(WEBDAV_BASE_PATH + path, 401, "API密钥信息格式错误");
       }
       actualUserType = UserType.API_KEY;
     } else {
-      return createErrorResponse("/dav" + path, 401, "未知用户类型");
+      return createErrorResponse(WEBDAV_BASE_PATH + path, 401, "未知用户类型");
     }
 
     const { getEncryptionSecret } = await import("../../utils/environmentUtils.js");
@@ -661,7 +661,7 @@ async function handleVirtualDirectoryPropfind(mounts, path, basicPath, requestIn
     const responses = [];
 
     // 处理当前虚拟目录
-    const webdavPath = "/dav" + normalizePath(path, true);
+    const webdavPath = WEBDAV_BASE_PATH + normalizePath(path, true);
     const properties = getPropertiesForRequest(result, path, requestInfo);
     responses.push({
       href: webdavPath,
@@ -703,34 +703,26 @@ async function handleVirtualDirectoryPropfind(mounts, path, basicPath, requestIn
  */
 async function handleStoragePropfind(fileSystem, path, requestInfo, userIdOrInfo, actualUserType) {
   try {
-    let result;
-
-    if (requestInfo.depth === "0") {
-      // 只获取当前资源信息
-      try {
-        const fileInfo = await fileSystem.getFileInfo(path, userIdOrInfo, actualUserType);
-        result = {
-          path: path,
-          isDirectory: fileInfo.isDirectory,
-          name: fileInfo.name,
-          size: fileInfo.size,
-          modified: fileInfo.modified,
-          created: fileInfo.created,
-          items: [], // depth=0时不包含子项
-        };
-      } catch (error) {
-        throw error;
-      }
-    } else if (requestInfo.depth === "1") {
-      // 获取当前资源和直接子项
-      try {
-        result = await fileSystem.listDirectory(path, userIdOrInfo, actualUserType);
-      } catch (error) {
-        throw error;
-      }
-    } else {
+    if (requestInfo.depth !== "0" && requestInfo.depth !== "1") {
       // infinity深度 - 大多数服务器会拒绝此请求
-      return createErrorResponse("/dav" + path, 403, "Depth infinity is not supported for performance reasons");
+      return createErrorResponse(WEBDAV_BASE_PATH + path, 403, "Depth infinity is not supported for performance reasons");
+    }
+
+    // 先确认资源存在及其类型，再决定是否列出子项。
+    // 之前 depth=1 直接走 listDirectory：不存在的资源会被当成目录建出 207 + collection 响应，
+    // rclone/部分客户端因此报 "is a directory not a file"。
+    const fileInfo = await fileSystem.getFileInfo(path, userIdOrInfo, actualUserType);
+    const isDirectory = fileInfo.isDirectory === true || fileInfo.type === "directory";
+    const result = {
+      ...fileInfo,
+      path,
+      isDirectory,
+      items: [],
+    };
+
+    if (requestInfo.depth === "1" && isDirectory) {
+      const listing = await fileSystem.listDirectory(path, userIdOrInfo, actualUserType);
+      result.items = listing.items || [];
     }
 
     const responses = [];
@@ -738,7 +730,7 @@ async function handleStoragePropfind(fileSystem, path, requestInfo, userIdOrInfo
     // 处理当前资源
     // 修复：根据返回的数据结构判断是否为目录
     const isCurrentDirectory = result.type === "directory" || result.isDirectory === true;
-    const webdavPath = "/dav" + normalizePath(path, isCurrentDirectory);
+    const webdavPath = WEBDAV_BASE_PATH + normalizePath(path, isCurrentDirectory);
 
     // 修复：为当前资源构建正确的属性对象
     const currentResource = {
@@ -758,7 +750,7 @@ async function handleStoragePropfind(fileSystem, path, requestInfo, userIdOrInfo
       for (const item of result.items) {
         // 修复：确保子项有正确的isDirectory属性
         const itemIsDirectory = item.isDirectory === true;
-        const itemPath = "/dav" + normalizePath(item.path, itemIsDirectory);
+        const itemPath = WEBDAV_BASE_PATH + normalizePath(item.path, itemIsDirectory);
 
         const itemProperties = getPropertiesForRequest(item, item.path, requestInfo);
         responses.push({

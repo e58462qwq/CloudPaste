@@ -33,15 +33,6 @@ export async function getAppliedMigrationIds(db) {
   return new Set(rows.map((r) => r.id).filter(Boolean));
 }
 
-async function hasMigrationId(db, id) {
-  try {
-    const row = await db.prepare(`SELECT 1 AS ok FROM ${MIGRATIONS_TABLE} WHERE id = ?`).bind(id).first();
-    return !!row;
-  } catch {
-    return false;
-  }
-}
-
 function nowIso() {
   return new Date().toISOString();
 }
@@ -79,11 +70,16 @@ export async function applyMigrations(runtime, migrations) {
         })
       : `INSERT OR IGNORE INTO ${MIGRATIONS_TABLE} (id, applied_at) VALUES (?, ?)`;
 
+  // 一次性读取已应用集合（1 次查询），在内存中比对。
+  // 原实现逐条 SELECT：35 条迁移 = 35 次跨区往返，Worker 冷启动时会随
+  // 「边缘 → 主库」延迟线性放大，导致每个新 isolate 的首个请求卡数秒。
+  const applied = await getAppliedMigrationIds(db);
+
   for (const migration of list) {
-    // 注意：不要只依赖进程内缓存的 applied set。
-    // 某些迁移（例如 baseline/adopt）可能会批量写入 schema_migrations，
-    // 需要以 DB 中真实数据为准，避免后续迁移被重复执行。
-    if (await hasMigrationId(db, migration.id)) {
+    // 注意：不要只依赖循环开始时的快照。
+    // 某些迁移（例如 baseline/adopt）会批量写入 schema_migrations，
+    // 所以真正执行过迁移后要重新同步一次，保持与原实现相同的正确性语义。
+    if (applied.has(migration.id)) {
       continue;
     }
 
@@ -93,6 +89,11 @@ export async function applyMigrations(runtime, migrations) {
 
     // 记录迁移已应用（并发场景下允许重复写入被忽略）
     await db.prepare(insertSql).bind(migration.id, nowIso()).run();
+    applied.add(migration.id);
+
+    // 迁移已完成的库根本不会进这里 —— 热路径仍然只有 1 次查询。
+    const refreshed = await getAppliedMigrationIds(db);
+    for (const id of refreshed) applied.add(id);
   }
 }
 

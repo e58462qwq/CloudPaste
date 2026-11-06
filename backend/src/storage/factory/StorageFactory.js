@@ -32,6 +32,7 @@ import {
 import { ValidationError, NotFoundError, DriverContractError } from "../../http/errors.js";
 import { isCloudflareWorkerEnvironment, isNodeJSEnvironment, toBool } from "../../utils/environmentUtils.js";
 import { enforceDriverContract } from "./DriverContractEnforcer.js";
+import { normalizeRangeFallbackPolicy } from "../streaming/rangeFallbackPolicy.js";
 
 /**
  * 存储驱动注册表
@@ -985,6 +986,10 @@ StorageFactory.registerDriver(StorageFactory.SUPPORTED_TYPES.WEBDAV, {
       endpoint_url: cfg?.endpoint_url,
       username: cfg?.username,
       tls_insecure_skip_verify: cfg?.tls_insecure_skip_verify ? 1 : 0,
+      // 上游忽略 Range 时的降级策略：software=软件切片；full=直接返回 200 全量
+      // WebDAV 历史行为就是 full（软件切片在 Cloudflare→Cloudflare 场景会黑屏），
+      // 因此这里缺省回落 full 以保持向后兼容，不强依赖存量 config_json 是否已迁移。
+      range_fallback_policy: normalizeRangeFallbackPolicy(cfg?.range_fallback_policy, "full"),
     };
 
     if (withSecrets) {
@@ -1050,6 +1055,18 @@ StorageFactory.registerDriver(StorageFactory.SUPPORTED_TYPES.WEBDAV, {
         ui: { descriptionKey: "admin.storage.description.tls_insecure_skip_verify" },
       },
       {
+        name: "range_fallback_policy",
+        type: "enum",
+        required: false,
+        defaultValue: "full",
+        labelKey: "admin.storage.fields.range_fallback_policy",
+        enumValues: [
+          { value: "full", labelKey: "admin.storage.rangeFallbackPolicy.full" },
+          { value: "software", labelKey: "admin.storage.rangeFallbackPolicy.software" },
+        ],
+        ui: { descriptionKey: "admin.storage.description.range_fallback_policy" },
+      },
+      {
         name: "url_proxy",
         type: "string",
         required: false,
@@ -1077,7 +1094,7 @@ StorageFactory.registerDriver(StorageFactory.SUPPORTED_TYPES.WEBDAV, {
         {
           name: "advanced",
           titleKey: "admin.storage.groups.advanced",
-          fields: ["url_proxy", ["enable_disk_usage", "tls_insecure_skip_verify"]],
+          fields: ["url_proxy", ["enable_disk_usage", "tls_insecure_skip_verify"], "range_fallback_policy"],
         },
       ],
       summaryFields: ["endpoint_url", "username", "default_folder", "enable_disk_usage"],

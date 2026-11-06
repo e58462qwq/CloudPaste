@@ -1,7 +1,18 @@
 import { ValidationError } from "../../../http/errors.js";
 import { decryptValue } from "../../../utils/crypto.js";
 import { createClient } from "webdav";
+import { Buffer } from "buffer";
 import https from "https";
+
+/**
+ * 按 RFC 7617 生成 UTF-8 的 Basic Authorization 头。
+ * webdav 客户端内部的 base-64 库只支持 Latin1，中文凭据会直接抛错，所以这里自己编码。
+ */
+function buildUtf8BasicAuthHeader(username, password) {
+  const raw = `${username ?? ""}:${password ?? ""}`;
+  const encoded = Buffer.from(raw, "utf8").toString("base64");
+  return `Basic ${encoded}`;
+}
 
 function normalizeEndpointUrlForClient(value) {
   const raw = value == null ? "" : String(value).trim();
@@ -65,8 +76,9 @@ export async function webDavTestConnection(config, encryptionSecret) {
       : undefined;
   const clientOptions = agent ? { httpsAgent: agent } : {};
   const client = createClient(endpoint, {
-    username,
-    password,
+    headers: {
+      Authorization: buildUtf8BasicAuthHeader(username, password),
+    },
     ...clientOptions,
   });
 

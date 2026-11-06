@@ -121,6 +121,8 @@ export class MountManager {
     this.db = db;
     this.encryptionSecret = encryptionSecret;
     this.repositoryFactory = ensureRepositoryFactory(db, repositoryFactory);
+    // 运行时环境：FileSystem / 索引层需要它推导数据库方言（DB_PROVIDER / DB_DIALECT）
+    this.env = options?.env ?? null;
 
     // 调试开关：驱动缓存日志
     // 只认 true/false（不区分大小写）

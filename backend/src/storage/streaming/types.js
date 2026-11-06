@@ -53,6 +53,7 @@
  * @property {any} [userIdOrInfo] - 用户上下文
  * @property {string} [userType] - 用户类型
  * @property {Object} [db] - 数据库连接
+ * @property {Object} [env] - 运行时环境（读 STORAGE_PROBE_SIZE_TIMEOUT_MS；缺省回落到 mountManager.env）
  */
 
 /**

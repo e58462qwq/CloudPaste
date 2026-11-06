@@ -713,7 +713,16 @@ export class HuggingFaceDatasetsStorageDriver extends BaseDriver {
       Accept: "*/*",
     }, url);
 
+    // 关键：先把文件总长问出来。
+    // 不传 size 时 descriptor.size 恒为 null，下游 buildResponseHeaders() 就不会写
+    // Content-Length / Content-Range，响应只能是 chunked —— chunked 加上游中途断流，
+    // 客户端无法区分「正常结束」和「被截断」，也无法拖动视频进度条。
+    const remoteMeta = await this._resolveRemoteMeta(url, headers);
+
     return createHttpStreamDescriptor({
+      size: remoteMeta.size,
+      etag: remoteMeta.etag,
+      lastModified: remoteMeta.lastModified,
       contentType: guessedContentType,
       fetchResponse: async (signal) => {
         const resp = await fetch(url, { method: "GET", headers, signal });
@@ -749,6 +758,75 @@ export class HuggingFaceDatasetsStorageDriver extends BaseDriver {
         return await fetch(url, { method: "HEAD", headers, signal });
       },
     });
+  }
+
+  /**
+   * 解析 HF resolve 地址对应文件的元信息（size / etag / lastModified）。
+   *
+   * - 跟随重定向后的 200 必带 Content-Length（= 真实文件大小）
+   * - 不跟随重定向时是 302，带 X-Linked-Size（= 真实文件大小），
+   *   而 Content-Length 是重定向体长度（约 1KB），不可当文件大小用
+   *
+   * 失败一律返回 { size: null }，退回原来的「长度未知」行为，不影响可用性。
+   * 结果按 URL 缓存 META_TTL_MS，避免每个请求都多一跳。
+   *
+   * @private
+   */
+  async _resolveRemoteMeta(url, headers) {
+    const META_TTL_MS = 5 * 60 * 1000;
+    const cache = (this.__remoteMetaCache ||= new Map());
+    const hit = cache.get(url);
+    if (hit && Date.now() - hit.at < META_TTL_MS) return hit.meta;
+
+    const meta = { size: null, etag: null, lastModified: null };
+    const toPositiveInt = (raw) => {
+      const n = raw === null || raw === undefined ? NaN : Number(raw);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+
+    try {
+      const resp = await fetch(url, {
+        method: "HEAD",
+        headers,
+        redirect: "follow",
+        signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined,
+      });
+      if (resp && resp.ok) {
+        meta.size = toPositiveInt(resp.headers.get("content-length"));
+        meta.etag = resp.headers.get("etag") || null;
+        const lastModifiedRaw = resp.headers.get("last-modified");
+        if (lastModifiedRaw) {
+          const parsedDate = new Date(lastModifiedRaw);
+          if (!Number.isNaN(parsedDate.getTime())) meta.lastModified = parsedDate;
+        }
+      }
+    } catch {
+      // ignore，走下面的 X-Linked-Size 兜底
+    }
+
+    // HEAD 拿不到再退一步：不跟随重定向，读 X-Linked-Size
+    if (meta.size === null) {
+      try {
+        const resp = await fetch(url, {
+          method: "HEAD",
+          headers,
+          redirect: "manual",
+          signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined,
+        });
+        meta.size = toPositiveInt(resp?.headers?.get?.("x-linked-size"));
+      } catch {
+        meta.size = null;
+      }
+    }
+
+    cache.set(url, { meta, at: Date.now() });
+    if (cache.size > 512) {
+      const now = Date.now();
+      for (const [k, v] of cache) {
+        if (now - v.at >= META_TTL_MS) cache.delete(k);
+      }
+    }
+    return meta;
   }
 
   async generateDownloadUrl(subPath, ctx = {}) {

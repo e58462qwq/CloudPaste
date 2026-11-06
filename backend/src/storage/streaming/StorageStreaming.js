@@ -31,6 +31,55 @@ import { smartWrapStreamWithByteSlice } from "./ByteSliceStream.js";
 //   - 上游支持：正常返回 206
 const VIDEO_SOFTWARE_SLICE_MAX_START_BYTES = 100 * 1024 * 1024; // 100MB
 
+// Range 场景下“文件大小未知”时的探测超时（毫秒）。
+// 原来硬编码 8 秒：上游 HEAD 慢一点（实测 2–14s 很常见）就会每个 Range 请求
+// 白等满 8 秒，播放器表现为「拖动进度条后卡住」。改为可由环境变量覆盖。
+const DEFAULT_PROBE_SIZE_TIMEOUT_MS = 8000;
+const PROBE_SIZE_TIMEOUT_ENV_KEY = "STORAGE_PROBE_SIZE_TIMEOUT_MS";
+
+// 探测失败的负缓存：同一个文件在一段时间内不再重复探测，直接走 200 全量，
+// 避免「每来一个 Range 请求就再白等一次超时」。
+const PROBE_SIZE_FAILURE_TTL_MS = 60 * 1000;
+const PROBE_SIZE_FAILURE_CACHE_MAX = 512;
+const probeSizeFailureCache = new Map();
+
+function resolveProbeSizeTimeoutMs(env) {
+  const raw =
+    env?.[PROBE_SIZE_TIMEOUT_ENV_KEY] ??
+    (typeof process !== "undefined" ? process.env?.[PROBE_SIZE_TIMEOUT_ENV_KEY] : undefined);
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_PROBE_SIZE_TIMEOUT_MS;
+  // 下限 500ms 防止配置成 0/负数变成「必失败」，上限 60s 防止一次请求挂太久
+  return Math.min(Math.max(Math.floor(parsed), 500), 60000);
+}
+
+function readProbeSizeFailureCache(key) {
+  const expireAt = probeSizeFailureCache.get(key);
+  if (!expireAt) return 0;
+  const remain = expireAt - Date.now();
+  if (remain <= 0) {
+    probeSizeFailureCache.delete(key);
+    return 0;
+  }
+  return remain;
+}
+
+function writeProbeSizeFailureCache(key) {
+  probeSizeFailureCache.set(key, Date.now() + PROBE_SIZE_FAILURE_TTL_MS);
+  if (probeSizeFailureCache.size > PROBE_SIZE_FAILURE_CACHE_MAX) {
+    const now = Date.now();
+    for (const [k, expireAt] of probeSizeFailureCache) {
+      if (expireAt <= now) probeSizeFailureCache.delete(k);
+    }
+    // 仍然超限时丢最早写入的一批，保证缓存不会无限增长
+    while (probeSizeFailureCache.size > PROBE_SIZE_FAILURE_CACHE_MAX) {
+      const firstKey = probeSizeFailureCache.keys().next().value;
+      if (firstKey === undefined) break;
+      probeSizeFailureCache.delete(firstKey);
+    }
+  }
+}
+
 const isLikelyVideoPath = (p) => {
   const s = (p || "").toLowerCase();
   return s.endsWith(".mp4") || s.endsWith(".m4v") || s.endsWith(".mov") || s.endsWith(".webm") || s.endsWith(".mkv") || s.endsWith(".avi");
@@ -327,11 +376,32 @@ export class StorageStreaming {
       // 解析 Range 请求
       // Range 场景：若文件大小未知但描述符提供 probeSize，则优先探测 size 后再解析 Range
       if (rangeHeader && (descriptor.size === null || descriptor.size <= 0) && typeof descriptor.probeSize === "function") {
+        const env = options?.env || this.mountManager?.env || null;
+        const probeKey = `${channel}:${storageConfigId || resolvedMount?.id || ""}:${path}`;
+        const cachedFailureMs = readProbeSizeFailureCache(probeKey);
+
+        if (cachedFailureMs > 0) {
+          // 该文件刚刚探测失败过：短时间内不再重复付超时代价，直接走 200 全量，
+          // 避免「每个 Range 请求都白等一次超时」导致播放器反复卡住。
+          console.warn(
+            `${logPrefix} 跳过 size 探测（${Math.ceil(cachedFailureMs / 1000)}s 内已失败过），直接返回 200 全量`,
+          );
+          return this._create200Reader(descriptor, channel);
+        }
+
+        const probeTimeoutMs = resolveProbeSizeTimeoutMs(env);
         try {
           // 不将探测失败视为致命错误，失败则回退为 200 全量响应
-          await descriptor.probeSize({ signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined });
+          await descriptor.probeSize({
+            signal: AbortSignal.timeout ? AbortSignal.timeout(probeTimeoutMs) : undefined,
+          });
+          if (descriptor.size === null || descriptor.size <= 0) {
+            // 探测「成功返回」但没拿到长度（上游没给 Content-Length 也不支持 Range）：同样记为失败
+            writeProbeSizeFailureCache(probeKey);
+          }
         } catch (e) {
-          console.warn(`${logPrefix} Range size 探测失败，将回退为 200: ${e?.message || String(e)}`);
+          writeProbeSizeFailureCache(probeKey);
+          console.warn(`${logPrefix} Range size 探测失败(${probeTimeoutMs}ms)，将回退为 200: ${e?.message || String(e)}`);
         }
       }
 
@@ -487,7 +557,8 @@ export class StorageStreaming {
         return new Response(null, { status, headers });
       }
 
-      const handle = await reader.getBody();
+      // 把传入请求的 signal 一路带到驱动层：客户端断开时由运行时原生取消上游请求
+      const handle = await reader.getBody({ signal: options?.request?.signal });
       if (!handle) {
         return new Response(null, { status, headers });
       }
@@ -513,10 +584,12 @@ export class StorageStreaming {
         }
       }
 
-      // 对于 WebReadableStream（有 getReader 方法），直接作为 Response body 交给运行时处理
+      // 直接把原生流交给运行时，不要再包一层 JS ReadableStream。
+      // 在 Workers 运行时下，被 JS 包装过的流不会按背压消费，大文件响应会被截断；
+      // 这是运行时差异 —— 同样的写法在 Node 下内存为常数。
+      // 客户端断开时的取消语义，改由 request.signal 传到驱动层实现。
       if (stream && typeof stream.getReader === "function") {
-        const body = wrapWebReadableStreamWithClose(stream, handle?.close);
-        return new Response(body, { status, headers });
+        return new Response(stream, { status, headers });
       }
 
       // 对于 Node Readable（本地存储等场景），必须转换为 Web ReadableStream 并保持“边读边回”。
@@ -657,9 +730,9 @@ export class StorageStreaming {
     return {
       status: 200,
       headers,
-      async getBody() {
+      async getBody(options = {}) {
         if (closed) return null;
-        streamHandle = await descriptor.getStream();
+        streamHandle = await descriptor.getStream({ signal: options?.signal });
         return streamHandle;
       },
       async close() {
@@ -695,12 +768,12 @@ export class StorageStreaming {
     return {
       status: 206,
       headers,
-      async getBody() {
+      async getBody(options = {}) {
         if (closed) return null;
 
         // 优先使用驱动原生 Range 支持
         if (typeof descriptor.getRange === "function") {
-          streamHandle = await descriptor.getRange(range);
+          streamHandle = await descriptor.getRange(range, { signal: options?.signal });
 
           // 关键检测：驱动是否真正支持 Range 请求
           // 部分 WebDAV 服务器会忽略 Range 头，返回完整内容
@@ -772,7 +845,7 @@ export class StorageStreaming {
         const fallbackPolicy = descriptor?.rangeFallbackPolicy || "software";
         if (fallbackPolicy === "full") {
           console.log(`[StorageStreaming] 驱动不支持 getRange 方法，降级为 200 全量响应（忽略 Range）: ${start}-${end}`);
-          streamHandle = await descriptor.getStream();
+          streamHandle = await descriptor.getStream({ signal: options?.signal });
           const fallbackHeaders = buildResponseHeaders(descriptor, null, channel);
           return {
             stream: streamHandle.stream,
@@ -790,7 +863,7 @@ export class StorageStreaming {
           console.warn(`[StorageStreaming] 警告：该切片需要先读取并丢弃前 ${start} 字节（约 ${mb}MB），大跳转会很费流量且很慢`);
         }
 
-        streamHandle = await descriptor.getStream();
+        streamHandle = await descriptor.getStream({ signal: options?.signal });
         const originalStream = streamHandle.stream;
         const originalClose = streamHandle.close;
         const slicedStream = smartWrapStreamWithByteSlice(originalStream, start, end);
