@@ -829,6 +829,51 @@ export async function runLegacyMigrationByVersion(db, version) {
       break;
     }
 
+    case 35: {
+      console.log("版本35：新增默认任务「清理失效/过期文件」...");
+      // 说明：
+      // - 该任务的 handler 早就在 registry 里注册好了，但一直没有任何默认 scheduled_jobs 行，
+      //   管理员不手动建 job 就永远不会被定时触发（表现为「定时任务检测不到失效和过期文件」）。
+      // - 默认 dryRun=true：首次运行只统计命中数量，不删除任何数据，确认口径后再关闭。
+      try {
+        const intervalSec = 24 * 60 * 60;
+        const nextRunAfterIso = new Date(Date.now() + intervalSec * 1000).toISOString();
+        await db
+          .prepare(
+            `
+            INSERT INTO ${DbTables.SCHEDULED_JOBS} (task_id, handler_id, name, description, enabled, schedule_type, interval_sec, next_run_after, config_json)
+            SELECT ?, ?, ?, ?, 1, 'interval', ?, ?, ?
+            WHERE NOT EXISTS (
+              SELECT 1 FROM ${DbTables.SCHEDULED_JOBS} WHERE task_id = ?
+            )
+          `,
+          )
+          .bind(
+            "cleanup_invalid_files",
+            "cleanup_invalid_files",
+            "清理失效/过期文件（默认）",
+            "定期清理已过期或查看次数已用尽的文件记录。默认试运行只统计，确认后关闭 dryRun 才会真正删除。",
+            intervalSec,
+            nextRunAfterIso,
+            JSON.stringify({
+              dryRun: true,
+              batchSize: 100,
+              maxBatches: 5,
+              deleteExpired: true,
+              deleteViewsExhausted: true,
+              deleteStorageObject: false,
+              maxStorageDeletes: 50,
+            }),
+            "cleanup_invalid_files",
+          )
+          .run();
+      } catch (e) {
+        console.warn("版本35：写入默认 cleanup_invalid_files 任务失败（可忽略）:", e?.message || e);
+      }
+
+      break;
+    }
+
     default:
       console.log(`未知的迁移版本: ${version}`);
       break;

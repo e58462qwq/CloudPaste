@@ -3,20 +3,22 @@ import { RepositoryFactory } from "../../repositories/index.js";
 import { ObjectStore } from "../../storage/object/ObjectStore.js";
 import { StorageFactory } from "../../storage/factory/StorageFactory.js";
 import { invalidateFsCache } from "../../cache/invalidation.js";
+import { isCloudflareWorkerEnvironment } from "../../utils/environmentUtils.js";
 
 /**
  * CleanupInvalidFilesTask
  * - 批量清理「失效 / 过期」的文件记录，与文件管理页的「检测有效性 + 一键选择失效文件」口径保持一致
  *
- * 判定口径（记录层，不访问存储）：
- * - 过期：expires_at 非空且早于当前时间
- * - 次数用尽：max_views 非空且 > 0，且 views > max_views（与 FileService.validateFileAccess 完全一致，
- *   注意是严格大于：views === max_views 时仍可再看一次，不能当作失效清掉）
+ * 判定口径分两层：
+ * - 记录层（默认开启）：过期（expires_at 早于当前时间）、次数用尽（views > max_views）
+ * - 存储层（verifyStorage，默认关闭）：逐个回源确认对象是否还存在，
+ *   能发现「记录还在、对象已被外部删除」的文件（即「检测有效性」里的 missing_object）
  *
  * 为什么不默认访问存储：
  * - 存储侧校验（对象是否真的还在）每个文件都要一次网络请求；在 Cloudflare Workers 上
  *   subrequest 有硬上限，定时任务跑满一次就会整批失败。所以本任务默认只做记录层判定，
- *   存储对象是否残留由「文件管理 → 检测有效性」按需确认。
+ *   存储对象是否残留由「文件管理 → 检测有效性」按需确认；需要时把 verifyStorage 打开，
+ *   并用 maxStorageChecks 限制单次校验条数。
  * - 需要连存储对象一起清理时，把 deleteStorageObject 打开，并用 maxStorageDeletes 限制单次条数。
  *
  * 安全性：
@@ -56,6 +58,28 @@ function getEncryptionSecretFromEnv(env) {
   }
   return secret;
 }
+
+/**
+ * 有界并发执行：存储校验是网络请求，串行太慢，全并发又会打穿 Workers 的 subrequest 配额
+ */
+async function runWithConcurrency(items, concurrency, fn) {
+  const limit = Math.max(1, Math.min(8, Math.trunc(Number(concurrency) || 1)));
+  const queue = items.slice();
+  const results = [];
+  const workers = Array.from({ length: Math.min(limit, queue.length) }, async () => {
+    while (queue.length > 0) {
+      const item = queue.shift();
+      // eslint-disable-next-line no-await-in-loop
+      results.push(await fn(item));
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+/** Workers 下 subrequest 有硬上限，存储校验条数必须收敛 */
+const WORKER_MAX_STORAGE_CHECKS = 20;
+const STORAGE_CHECK_CONCURRENCY = 4;
 
 export class CleanupInvalidFilesTask {
   constructor() {
@@ -148,6 +172,25 @@ export class CleanupInvalidFilesTask {
         max: 500,
         description: "仅在开启「连带删除存储对象」时生效。Cloudflare Workers 免费版 subrequest 上限为 50，建议不超过 20。",
       },
+      {
+        name: "verifyStorage",
+        label: "校验存储层（发现对象已丢失的文件）",
+        type: "boolean",
+        defaultValue: false,
+        required: true,
+        description:
+          "开启后会逐个回源确认对象是否还存在，从而发现「记录还在、对象已被外部删除」的失效文件（即「检测有效性」里的 missing_object）。需要网络请求，请配合下面的校验条数上限。",
+      },
+      {
+        name: "maxStorageChecks",
+        label: "单次最多校验文件数",
+        type: "number",
+        defaultValue: 50,
+        required: false,
+        min: 1,
+        max: 500,
+        description: "仅在开启「校验存储层」时生效。每个文件一次存储请求；Cloudflare Workers 部署会自动收敛到 20 以内。",
+      },
     ];
   }
 
@@ -168,10 +211,16 @@ export class CleanupInvalidFilesTask {
     const deleteViewsExhausted = toBool(config.deleteViewsExhausted, true);
     const deleteStorageObject = toBool(config.deleteStorageObject, false);
     const maxStorageDeletes = clampInt(config.maxStorageDeletes, { min: 1, max: 500, fallback: 50 });
+    const verifyStorage = toBool(config.verifyStorage, false);
+    const maxStorageChecksRequested = clampInt(config.maxStorageChecks, { min: 1, max: 500, fallback: 50 });
+    // Workers 的 subrequest 是硬上限，存储校验会逐文件发一次请求，必须收敛
+    const maxStorageChecks = isCloudflareWorkerEnvironment()
+      ? Math.min(maxStorageChecksRequested, WORKER_MAX_STORAGE_CHECKS)
+      : maxStorageChecksRequested;
 
-    if (!deleteExpired && !deleteViewsExhausted) {
+    if (!deleteExpired && !deleteViewsExhausted && !verifyStorage) {
       return {
-        summary: "未启用任何清理条件（已过期 / 次数用尽都关闭），本次未做任何处理",
+        summary: "未启用任何清理条件（已过期 / 次数用尽 / 存储层校验都关闭），本次未做任何处理",
         matched: 0,
         deletedRecords: 0,
         deletedStorageObjects: 0,
@@ -206,6 +255,7 @@ export class CleanupInvalidFilesTask {
           `
           SELECT
             COUNT(*) AS total,
+            SUM(CASE WHEN expires_at IS NOT NULL THEN 1 ELSE 0 END) AS with_expires_count,
             SUM(CASE WHEN expires_at IS NOT NULL AND expires_at < ? THEN 1 ELSE 0 END) AS expired_count,
             SUM(CASE WHEN max_views IS NOT NULL AND max_views > 0 AND views > max_views THEN 1 ELSE 0 END) AS views_count
           FROM ${DbTables.FILES}
@@ -216,6 +266,7 @@ export class CleanupInvalidFilesTask {
 
       return {
         total: Number(row?.total) || 0,
+        withExpiresAt: Number(row?.with_expires_count) || 0,
         expired: Number(row?.expired_count) || 0,
         viewsExhausted: Number(row?.views_count) || 0,
       };
@@ -225,6 +276,8 @@ export class CleanupInvalidFilesTask {
 
     // 命中总数：单次 COUNT，用于 dryRun 与统计（不必为了估算总量去反复取同一批行）
     const countCandidates = async () => {
+      // 只开了存储层校验时没有记录层条件，SQL 里不能出现空 WHERE
+      if (conditions.length === 0) return 0;
       const row = await db
         .prepare(`SELECT COUNT(*) AS cnt FROM ${DbTables.FILES} WHERE ${whereClause}`)
         .bind(...conditionParams)
@@ -237,6 +290,8 @@ export class CleanupInvalidFilesTask {
     const excludeIds = [];
 
     const pickCandidates = async () => {
+      // 只开了存储层校验时没有任何记录层条件，此时不存在记录层候选
+      if (conditions.length === 0) return [];
       const excludeClause = excludeIds.length
         ? ` AND id NOT IN (${excludeIds.map(() => "?").join(", ")})`
         : "";
@@ -252,6 +307,37 @@ export class CleanupInvalidFilesTask {
         `,
         )
         .bind(...conditionParams, ...excludeIds, batchSize)
+        .all();
+      return res?.results || [];
+    };
+
+    /**
+     * 取「尚未被记录层命中」的记录作为存储层校验对象：
+     * 记录层已命中的会在清理阶段直接删掉，不必再花 subrequest 去回源确认。
+     */
+    const pickStorageCheckTargets = async (limit, alreadyUsedIds) => {
+      const filters = ["storage_config_id IS NOT NULL", "storage_path IS NOT NULL"];
+      const params = [];
+      if (whereClause) {
+        filters.push(`NOT (${whereClause})`);
+        params.push(...conditionParams);
+      }
+      if (alreadyUsedIds.length > 0) {
+        filters.push(`id NOT IN (${alreadyUsedIds.map(() => "?").join(", ")})`);
+        params.push(...alreadyUsedIds);
+      }
+      const res = await db
+        .prepare(
+          `
+          SELECT id, filename, storage_config_id, storage_type, storage_path, file_path,
+                 expires_at, max_views, views
+          FROM ${DbTables.FILES}
+          WHERE ${filters.join(" AND ")}
+          ORDER BY created_at ASC
+          LIMIT ?
+        `,
+        )
+        .bind(...params, limit)
         .all();
       return res?.results || [];
     };
@@ -274,15 +360,70 @@ export class CleanupInvalidFilesTask {
       return objectStore;
     };
 
-    // 试运行：只做一次 COUNT，不写库，也不反复取同一批行来估算总量
+    /**
+     * 存储层校验（可选）：找出「记录还在、对象已被外部删除」的文件
+     * - 只校验记录层没命中的记录，避免为即将删除的记录白花 subrequest
+     * - 有界并发；Workers 下条数已收敛到 WORKER_MAX_STORAGE_CHECKS
+     */
+    let storageChecked = 0;
+    let storageMissing = 0;
+    let storageUnreachable = 0;
+    const storageMissingIds = [];
+
+    const runStorageCheck = async () => {
+      if (!verifyStorage) return;
+      const targets = await pickStorageCheckTargets(maxStorageChecks, excludeIds);
+      if (targets.length === 0) return;
+
+      await runWithConcurrency(targets, STORAGE_CHECK_CONCURRENCY, async (row) => {
+        storageChecked += 1;
+        try {
+          await ensureObjectStore().getInfoByStoragePath(row.storage_config_id, row.storage_path, { db });
+        } catch (error) {
+          const notFound = error?.name === "NotFoundError" || error?.status === 404;
+          if (notFound) {
+            storageMissing += 1;
+            if (row?.id) storageMissingIds.push(row.id);
+            return;
+          }
+          // 存储不可达不等于文件丢失，绝不能据此删除记录
+          storageUnreachable += 1;
+          console.warn("[CleanupInvalidFilesTask] 存储校验失败，无法判定（不会删除该记录）:", {
+            fileId: row?.id,
+            storageConfigId: row?.storage_config_id,
+            storagePath: row?.storage_path,
+            error: error?.message || error,
+          });
+        }
+      });
+    };
+
+    await runStorageCheck();
+
+    // 试运行：只统计，不写库
     if (dryRun) {
-      const total = await countCandidates();
+      const recordLevelTotal = await countCandidates();
+      const total = recordLevelTotal + storageMissingIds.length;
       const afterCounts = await readCounts();
       const durationMs = nowMs() - startedMs;
+
+      const parts = [`试运行：命中失效/过期文件 ${total} 条（未删除）`];
+      parts.push(`记录层 ${recordLevelTotal} 条`);
+      if (verifyStorage) {
+        parts.push(`存储层已丢失 ${storageMissingIds.length} 条（已校验 ${storageChecked} 条）`);
+        if (storageUnreachable > 0) parts.push(`存储不可达 ${storageUnreachable} 条（无法判定，不计入）`);
+      }
+      parts.push(`当前文件总数 ${afterCounts.total} 条`);
+      parts.push(`用时 ${durationMs}ms`);
+
       return {
-        summary: `试运行：命中失效/过期文件 ${total} 条（未删除），当前文件总数 ${afterCounts.total} 条，用时 ${durationMs}ms`,
+        summary: parts.join("，"),
         dryRun: true,
         matched: total,
+        recordLevelMatched: recordLevelTotal,
+        storageChecked,
+        storageMissing: storageMissingIds.length,
+        storageUnreachable,
         deletedRecords: 0,
         deletedPasswords: 0,
         deletedStorageObjects: 0,
@@ -295,6 +436,8 @@ export class CleanupInvalidFilesTask {
           after: afterCounts,
           deleteExpired,
           deleteViewsExhausted,
+          verifyStorage,
+          maxStorageChecks,
           deleteStorageObject,
           maxStorageDeletes,
           batchSize,
@@ -389,6 +532,32 @@ export class CleanupInvalidFilesTask {
       deletedRecords += getChanges(delFileRes);
     }
 
+    // 存储层校验命中的记录（对象已被外部删除）不满足记录层条件，需要单独删除
+    let storageMissingDeleted = 0;
+    if (storageMissingIds.length > 0) {
+      // 按 batchSize 切片，避免 IN 参数过长
+      for (let start = 0; start < storageMissingIds.length; start += batchSize) {
+        const slice = storageMissingIds.slice(start, start + batchSize);
+        const placeholders = slice.map(() => "?").join(", ");
+        // eslint-disable-next-line no-await-in-loop
+        const delPasswordRes = await db
+          .prepare(`DELETE FROM ${DbTables.FILE_PASSWORDS} WHERE file_id IN (${placeholders})`)
+          .bind(...slice)
+          .run();
+        deletedPasswords += getChanges(delPasswordRes);
+
+        // eslint-disable-next-line no-await-in-loop
+        const delFileRes = await db
+          .prepare(`DELETE FROM ${DbTables.FILES} WHERE id IN (${placeholders})`)
+          .bind(...slice)
+          .run();
+        const removed = getChanges(delFileRes);
+        deletedRecords += removed;
+        storageMissingDeleted += removed;
+      }
+      matched += storageMissingIds.length;
+    }
+
     // 存储对象有变动时，让 FS 视图缓存失效，避免列表继续展示已删除项
     for (const storageConfigId of touchedStorageConfigIds) {
       try {
@@ -412,6 +581,10 @@ export class CleanupInvalidFilesTask {
     const summaryParts = [];
     summaryParts.push(`清理文件记录 ${deletedRecords} 条`);
     summaryParts.push(`连带删除口令记录 ${deletedPasswords} 条`);
+    if (verifyStorage) {
+      summaryParts.push(`存储层校验 ${storageChecked} 条，其中对象已丢失 ${storageMissing} 条`);
+      if (storageUnreachable > 0) summaryParts.push(`存储不可达 ${storageUnreachable} 条（无法判定，已保留记录）`);
+    }
     if (deleteStorageObject) {
       summaryParts.push(`删除存储对象 ${deletedStorageObjects} 个`);
       if (storageDeleteFailures > 0) summaryParts.push(`存储删除失败 ${storageDeleteFailures} 个（已保留记录）`);
@@ -424,11 +597,16 @@ export class CleanupInvalidFilesTask {
       summary: summaryParts.join("，"),
       dryRun: false,
       matched,
+      recordLevelMatched: matched - storageMissingDeleted,
       deletedRecords,
       deletedPasswords,
       deletedStorageObjects,
       storageDeleteFailures,
       skippedForStorage,
+      storageChecked,
+      storageMissing,
+      storageMissingDeleted,
+      storageUnreachable,
       batches,
       totalFiles: afterCounts.total,
       stats: {
@@ -436,6 +614,8 @@ export class CleanupInvalidFilesTask {
         after: afterCounts,
         deleteExpired,
         deleteViewsExhausted,
+        verifyStorage,
+        maxStorageChecks,
         deleteStorageObject,
         maxStorageDeletes,
         batchSize,

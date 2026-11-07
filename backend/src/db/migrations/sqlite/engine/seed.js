@@ -59,6 +59,42 @@ export async function initDefaultSettings(db) {
     )
     .run();
 
+  // 为 cleanup_invalid_files 写入默认调度配置（若不存在）
+  // 注意：全新库由 initDatabase 建到最终态并预标记 app-v01..app-vNN，
+  // 迁移 case 35 不会执行，所以新库必须在这里同时写入；
+  // 存量库升级则由 migrations.js 的 case 35 补上。默认 dryRun 只统计。
+  const invalidFilesIntervalSec = 24 * 60 * 60;
+  const firstInvalidFilesNextRunIso = new Date(Date.now() + invalidFilesIntervalSec * 1000).toISOString();
+  await db
+    .prepare(
+      `
+      INSERT INTO ${DbTables.SCHEDULED_JOBS} (task_id, handler_id, name, description, enabled, schedule_type, interval_sec, next_run_after, config_json)
+      SELECT ?, ?, ?, ?, 1, 'interval', ?, ?, ?
+      WHERE NOT EXISTS (
+        SELECT 1 FROM ${DbTables.SCHEDULED_JOBS} WHERE task_id = ?
+      )
+    `,
+    )
+    .bind(
+      "cleanup_invalid_files",
+      "cleanup_invalid_files",
+      "清理失效/过期文件（默认）",
+      "定期清理已过期或查看次数已用尽的文件记录。默认试运行只统计，确认后关闭 dryRun 才会真正删除。",
+      invalidFilesIntervalSec,
+      firstInvalidFilesNextRunIso,
+      JSON.stringify({
+        dryRun: true,
+        batchSize: 100,
+        maxBatches: 5,
+        deleteExpired: true,
+        deleteViewsExhausted: true,
+        deleteStorageObject: false,
+        maxStorageDeletes: 50,
+      }),
+      "cleanup_invalid_files",
+    )
+    .run();
+
   const defaultSettings = [
     {
       key: "max_upload_size",

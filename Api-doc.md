@@ -725,7 +725,7 @@ X-Custom-Auth-Key: <api_key>
 | `scheduled_fs_index_rebuild` | FS 搜索索引重建 | business | 全量重建索引 |
 | `scheduled_fs_index_apply_dirty` | FS 索引增量应用 | business | 消费 dirty 队列 |
 | `refresh_storage_usage_snapshots` | 刷新存储用量快照 | maintenance | 刷新各存储配置的已用/总量快照 |
-| `cleanup_invalid_files` | 清理失效/过期文件 | maintenance | 按记录层口径清理已过期或查看次数用尽的文件 |
+| `cleanup_invalid_files` | 清理失效/过期文件 | maintenance | 记录层清理已过期/次数用尽，可选存储层校验发现对象已丢失 |
 
 `cleanup_invalid_files` 的配置项：
 
@@ -733,8 +733,14 @@ X-Custom-Auth-Key: <api_key>
 - `batchSize`（默认 `100`，1–500）/ `maxBatches`（默认 `5`，1–100）：分批与单次上限，剩余的下次继续。
 - `deleteExpired`（默认 `true`）：`expires_at` 早于当前时间的记录。
 - `deleteViewsExhausted`（默认 `true`）：`max_views` 非空且 `views > max_views` 的记录（与 `FileService.validateFileAccess` 完全一致；`views === max_views` 仍允许再看一次，不会被清理）。
+- `verifyStorage`（默认 `false`）：逐个回源确认对象是否还在，从而发现「记录还在、对象已被外部删除」的失效文件（即检测有效性里的 `missing_object`）。只校验记录层未命中的记录，不重复消耗请求。
+- `maxStorageChecks`（默认 `50`，1–500）：仅在 `verifyStorage` 开启时生效；每个文件一次存储请求，Cloudflare Workers 部署会自动收敛到 20 以内。
 - `deleteStorageObject`（默认 `false`）/ `maxStorageDeletes`（默认 `50`）：开启后回源删除存储对象，需网络请求；Workers 部署建议不超过 20。存储删除失败的文件记录会被保留，避免产生无法再定位的孤儿对象；对象已被上游删除（`NotFoundError`）时照常清理记录。
 
+运行结果里的诊断字段（`details`）：`recordLevelMatched`（记录层命中）、`storageChecked` / `storageMissing` / `storageMissingDeleted`（存储层已校验 / 对象已丢失 / 已清理）、`storageUnreachable`（存储不可达，**无法判定，绝不据此删除**）、`stats.before` 里的 `total` / `withExpiresAt` / `expired` / `viewsExhausted`。命中数为 0 时可据此判断是「库里没有失效记录」还是「某一层没开」。
+
+> 数据库升级到 schema 35 时会自动创建一条默认作业（`task_id = cleanup_invalid_files`，interval 24 小时，`dryRun: true` 只统计）。若该 `task_id` 已存在则不会覆盖。确认口径后把它改成 `dryRun: false`（并视需要开启 `verifyStorage`）即会真正清理。
+>
 > 该任务与「文件管理 → 检测有效性 → 选择失效文件」使用同一口径（对象缺失 / 记录缺失 / 已过期），可在管理面板手动执行，也可配成 interval 或 cron 定时跑。
 
 ---

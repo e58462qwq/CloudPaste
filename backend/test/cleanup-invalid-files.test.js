@@ -263,6 +263,119 @@ test("两个清理条件都关闭时直接返回，不访问数据库", async ()
   assert.equal(countFiles(db), 1);
 });
 
+test("verifyStorage：记录还在但对象已被外部删除的文件也应被识别并清理", async () => {
+  const db = setupDb();
+  // 记录层完全正常（未过期、次数未用尽），只有对象丢了
+  insertFile(db, { id: "object-gone" });
+  insertFile(db, { id: "object-ok" });
+
+  const task = new CleanupInvalidFilesTask();
+  const original = ObjectStoreInfoSpy.install((row) => {
+    if (row === "path/object-gone") {
+      const error = new Error("文件不存在");
+      error.name = "NotFoundError";
+      throw error;
+    }
+    return { size: 10 };
+  });
+
+  try {
+    const result = await task.run({
+      db,
+      env: { ENCRYPTION_SECRET: "test-secret" },
+      now: NOW,
+      config: { dryRun: false, deleteExpired: false, deleteViewsExhausted: false, verifyStorage: true },
+    });
+
+    assert.equal(result.storageChecked, 2);
+    assert.equal(result.storageMissing, 1);
+    assert.equal(result.deletedRecords, 1);
+    assert.equal(countFiles(db), 1);
+    assert.equal(db.sqlite.prepare("SELECT id FROM files").get().id, "object-ok");
+  } finally {
+    original();
+  }
+});
+
+test("verifyStorage + dryRun：只统计存储层命中数，不删除任何记录", async () => {
+  const db = setupDb();
+  insertFile(db, { id: "object-gone" });
+  insertFile(db, { id: "expired", expires_at: "2020-01-01T00:00:00.000Z" });
+
+  const task = new CleanupInvalidFilesTask();
+  const original = ObjectStoreInfoSpy.install(() => {
+    const error = new Error("文件不存在");
+    error.name = "NotFoundError";
+    throw error;
+  });
+
+  try {
+    const result = await task.run({
+      db,
+      env: { ENCRYPTION_SECRET: "test-secret" },
+      now: NOW,
+      config: { dryRun: true, verifyStorage: true },
+    });
+
+    assert.equal(result.dryRun, true);
+    assert.equal(result.recordLevelMatched, 1);
+    assert.equal(result.storageMissing, 1);
+    assert.equal(result.matched, 2);
+    assert.equal(result.deletedRecords, 0);
+    assert.equal(countFiles(db), 2);
+  } finally {
+    original();
+  }
+});
+
+test("verifyStorage：存储不可达（非 NotFound）不算文件丢失，记录必须保留", async () => {
+  const db = setupDb();
+  insertFile(db, { id: "unreachable" });
+
+  const task = new CleanupInvalidFilesTask();
+  const original = ObjectStoreInfoSpy.install(() => {
+    throw new Error("connect ECONNREFUSED");
+  });
+
+  try {
+    const result = await task.run({
+      db,
+      env: { ENCRYPTION_SECRET: "test-secret" },
+      now: NOW,
+      config: { dryRun: false, deleteExpired: false, deleteViewsExhausted: false, verifyStorage: true },
+    });
+
+    assert.equal(result.storageChecked, 1);
+    assert.equal(result.storageMissing, 0);
+    assert.equal(result.storageUnreachable, 1);
+    assert.equal(result.deletedRecords, 0);
+    assert.equal(countFiles(db), 1);
+  } finally {
+    original();
+  }
+});
+
+/**
+ * 只替换 ObjectStore.prototype.getInfoByStoragePath，避免真连存储
+ * impl 收到 storagePath，可抛 NotFoundError（对象已丢失）或返回 { size }
+ */
+const ObjectStoreInfoSpy = {
+  install(impl) {
+    const proto = ObjectStore.prototype;
+    const originalDescriptor = Object.getOwnPropertyDescriptor(proto, "getInfoByStoragePath");
+    proto.getInfoByStoragePath = async function (_storageConfigId, key) {
+      return await impl(key);
+    };
+    return () => {
+      if (originalDescriptor) {
+        Object.defineProperty(proto, "getInfoByStoragePath", originalDescriptor);
+      } else {
+        delete proto.getInfoByStoragePath;
+      }
+    };
+  },
+};
+
 /**
  * 只替换 ObjectStore.prototype.deleteByStoragePath，避免真连存储
  */
