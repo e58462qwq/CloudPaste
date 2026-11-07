@@ -18,7 +18,9 @@ class UrlCacheManager extends BaseCache {
     };
 
     // - 通过版本号让旧缓存自动失效（不需要手动清缓存）
-    this.keyVersion = options.keyVersion || "v3";
+    // - v4：custom_host 直链改为逐段百分号编码（修复文件名含 `#`/`?` 时链接被截断），
+    //   旧版本缓存里是未编码的坏链接，必须整批作废
+    this.keyVersion = options.keyVersion || "v4";
   }
 
   generateKey(storageConfigId, storagePath, forceDownload, userType, userId) {

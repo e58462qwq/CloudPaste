@@ -4,6 +4,8 @@
  * 输出：preview/download 链接及类型信息
  */
 
+import { joinUrlWithEncodedPath } from "./PathCodec.js";
+
 // 提取驱动返回的 URL
 function pickUrl(result) {
   if (!result) return "";
@@ -47,11 +49,11 @@ export async function resolveStorageLinks({
   const proxyPolicy = mount?.webdav_policy || null;
 
   // 构建 custom_host 直链
+  // path 是未编码的对象 key，可能含 `#` `?` `%` 空格 中文 emoji；
+  // 原样拼接会让浏览器把 `#` 当 fragment 起点而截断链接，必须逐段编码。
   const buildCustomHostUrl = () => {
     if (!customHost) return "";
-    const base = customHost.endsWith("/") ? customHost.slice(0, -1) : customHost;
-    const normalized = path.startsWith("/") ? path.slice(1) : path;
-    return `${base}/${normalized}`;
+    return joinUrlWithEncodedPath(customHost, path);
   };
 
   // 优先考虑挂载的代理模式

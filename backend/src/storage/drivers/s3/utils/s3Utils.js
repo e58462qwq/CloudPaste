@@ -8,6 +8,7 @@ import { ConfiguredRetryStrategy } from "@smithy/util-retry";
 import { decryptValue } from "../../../../utils/crypto.js";
 import { S3ProviderTypes } from "../../../../constants/index.js";
 import { getEffectiveMimeType, getContentTypeAndDisposition } from "../../../../utils/fileUtils.js";
+import { encodePathSegments } from "../../../utils/PathCodec.js";
 import { ValidationError, S3DriverError } from "../../../../http/errors.js";
 /**
  * 创建S3客户端
@@ -122,10 +123,15 @@ function buildS3Url(s3Config, storagePath) {
   // 确保storagePath不以斜杠开始
   const normalizedPath = storagePath.startsWith("/") ? storagePath.slice(1) : storagePath;
 
+  // 与直链同一口径：对象 key 里的 `#` `?` `%` 空格 中文 emoji 必须逐段编码，
+  // 否则这个 publicUrl 一拼出来就在 `#` 处被截断，调用方拿到的是打不开的链接
+  const encodedPath = encodePathSegments(normalizedPath);
+  const encodedBucket = encodePathSegments(bucketName);
+
   // 根据配置选择合适的URL格式(路径样式vs虚拟主机样式)
   if (s3Config.path_style === 1) {
     // 路径样式: https://endpoint/bucket/key
-    return `${endpoint}/${bucketName}/${normalizedPath}`;
+    return `${endpoint}/${encodedBucket}/${encodedPath}`;
   } else {
     // 虚拟主机样式: https://bucket.endpoint/key
 
@@ -138,7 +144,7 @@ function buildS3Url(s3Config, storagePath) {
       // 处理无效URL，保持原样
     }
 
-    return `${endpoint.split("//")[0]}//${bucketName}.${domain}/${normalizedPath}`;
+    return `${endpoint.split("//")[0]}//${bucketName}.${domain}/${encodedPath}`;
   }
 }
 
@@ -220,11 +226,16 @@ export function generateCustomHostDirectUrl(s3Config, storagePath) {
   const normalizedPath = storagePath.startsWith("/") ? storagePath.slice(1) : storagePath;
   const customHost = s3Config.custom_host.endsWith("/") ? s3Config.custom_host.slice(0, -1) : s3Config.custom_host;
 
+  // 对象 key 里可能有 `#` `?` `%` 空格 中文 emoji：直接拼进 URL 会被浏览器当成
+  // fragment/query 起点而截断（`#` 之后的内容整段丢失，链接打不开）。
+  // 这里逐段百分号编码，存储里的 key 本身保持不变。
+  const encodedPath = encodePathSegments(normalizedPath);
+
   // 根据path_style配置决定是否包含bucket名称
   if (s3Config.path_style) {
-    return `${customHost}/${s3Config.bucket_name}/${normalizedPath}`;
+    return `${customHost}/${encodePathSegments(s3Config.bucket_name)}/${encodedPath}`;
   } else {
-    return `${customHost}/${normalizedPath}`;
+    return `${customHost}/${encodedPath}`;
   }
 }
 

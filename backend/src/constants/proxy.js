@@ -1,4 +1,5 @@
 import { ValidationError } from "../http/errors.js";
+import { encodePathSegments } from "../storage/utils/PathCodec.js";
 
 /**
  * 代理功能相关常量配置
@@ -146,12 +147,17 @@ export function toAbsoluteUrlIfRelative(request, maybeUrl) {
 
 /**
  * 构建本地 /api/p 代理URL（仅用于 CloudPaste 内部）
+ *
+ * 路径必须逐段百分号编码：挂载视图的文件名允许出现 `#`、`?`、`%`、空格、中文、emoji，
+ * 未编码时 `#` 会被浏览器当成 fragment 起点，整条链接从 `#` 处被截断（表现为"直链打不开"）。
+ * 入口侧（fsProxyRoutes）用 safeDecodeProxyPath 做一次 decodeURIComponent 还原原始路径。
+ *
  * @param {string} path - 文件路径（挂载视图路径）
  * @param {boolean} download - 是否为下载模式
  * @returns {string} 代理URL
  */
 export function buildProxyPath(path, download = false) {
-  const basePath = `${PROXY_CONFIG.ROUTE_PREFIX}${path}`;
+  const basePath = `${PROXY_CONFIG.ROUTE_PREFIX}${encodePathSegments(String(path || ""))}`;
   return download ? `${basePath}?download=true` : basePath;
 }
 

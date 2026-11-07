@@ -12,6 +12,7 @@ import { findMountPointByPathForProxy } from "../fs/utils/MountResolver.js";
 import { ProxySignatureService } from "../../services/ProxySignatureService.js";
 import { WORKER_ENTRY, buildSignedProxyUrl, buildSignedWorkerUrl } from "../../constants/proxy.js";
 import { UserType } from "../../constants/index.js";
+import { encodePathSegments } from "../utils/PathCodec.js";
 
 /**
  * 将文件名转为 URL path segment 安全的形式（用于 /api/s/:slug/:filename）。
@@ -453,7 +454,12 @@ export class LinkService {
     let proxiedUrl = finalUrl;
     if (hasUrlProxy) {
       try {
-        const entryPath = `${WORKER_ENTRY.FS_PREFIX}${path}${options.forceDownload ? "?download=true" : ""}`;
+        // 入口路径里的挂载视图路径必须逐段编码：
+        // 文件名允许含 `#` `?` `%` 空格 中文 emoji，未编码时 `#` 会被当成 fragment 起点，
+        // 反代侧拿到的是被截断的路径（与 custom_host 直链同一个坑）。
+        const entryPath = `${WORKER_ENTRY.FS_PREFIX}${encodePathSegments(String(path || ""))}${
+          options.forceDownload ? "?download=true" : ""
+        }`;
 
         // - /proxy/fs 对外入口：sign 只覆盖 fsPath + expire（不包含 owner）
         // - Telegram 需要的 owner 上下文：由外部代理用 TOKEN 调 /api/proxy/link 后在“上游 URL”里解决，
